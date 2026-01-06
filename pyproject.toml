@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mech-util"
+version = "0.1.0"
+description = "Shared utilities and schemas for mechanical design agents"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [
+    {name = "AISG Mechanical Design Team"}
+]
+
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mech_util*"]
+
