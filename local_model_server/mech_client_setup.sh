@@ -118,7 +118,7 @@ echo "=================================================="
 echo "Installing mech-design-orchestrator in editable mode..."
 echo "=================================================="
 
-pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-design-orchestrator
+pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util
 
 echo "=================================================="
 echo "Checking vLLM servers..."

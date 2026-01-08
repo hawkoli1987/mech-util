@@ -7,12 +7,16 @@ name = "mech-util"
 version = "0.1.0"
 description = "Shared utilities and schemas for mechanical design agents"
 readme = "README.md"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.9,<3.13"
 authors = [
     {name = "AISG Mechanical Design Team"}
 ]
 
-dependencies = []
+dependencies = [
+    "jinja2>=3.0",
+    "langchain-openai>=0.1",
+    "pydantic>=2.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
