@@ -1,0 +1,167 @@
+#!/bin/bash
+#PBS -N glm46_exp
+#PBS -o /dev/null
+#PBS -e /dev/null
+#PBS -q AISG_large
+#PBS -l select=1:mem=1000gb:ngpus=8:ncpus=100
+#PBS -l walltime=4:00:00
+
+# Experiment configuration - override with qsub -v
+# EXP_NAME: Experiment name (e.g., "1B_no_enforce_eager")
+# ENFORCE_EAGER: "yes" or "no"
+# ENABLE_EP: "yes" or "no" (Expert Parallelism)
+# MAX_MODEL_LEN: 8192, 32768, or 65536
+# EXTRA_ARGS: Additional vLLM arguments
+
+set -e
+
+EXP_NAME="${EXP_NAME:-default}"
+ENFORCE_EAGER="${ENFORCE_EAGER:-yes}"
+ENABLE_EP="${ENABLE_EP:-yes}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
+
+export SHARED_FS="/scratch/Projects/SPEC-SF-AISG"
+export CONTAINER_NAME="yuli_vllm_exp_${EXP_NAME}"
+export SQSH_DIR="${SHARED_FS}/sqsh"
+export IMG_NAME="vllm-openai"
+export LOCAL_IMG2="${SQSH_DIR}/${IMG_NAME}-v0.11.2.sqsh"
+export SQSH_FILE=$LOCAL_IMG2
+
+export CACHE_ROOT="${SHARED_FS}/cache"
+export HF_HOME="${SHARED_FS}/cache/huggingface_tmp"
+export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm_cache"
+export TORCH_HOME="$CACHE_ROOT/torch_cache"
+export TORCH_KERNEL_CACHE_PATH="$CACHE_ROOT/torch_cache/kernels"
+export TRITON_CACHE_DIR="/tmp/triton_cache_${PBS_JOBID:-$$}"
+export XDG_CACHE_HOME="$CACHE_ROOT/xdg_cache"
+export CUDA_CACHE_PATH="$CACHE_ROOT/cuda_cache"
+
+export LOG_DIR="${SHARED_FS}/log/mech/experiments/${EXP_NAME}/${PBS_JOBID}"
+mkdir -p "${LOG_DIR}"
+
+exec > >(tee -a "${LOG_DIR}/pbs.log") 2>&1
+
+echo "========================================"
+echo "Experiment: ${EXP_NAME}"
+echo "PBS Job ID: ${PBS_JOBID}"
+echo "Host: $(hostname)"
+echo "ENFORCE_EAGER: ${ENFORCE_EAGER}"
+echo "ENABLE_EP: ${ENABLE_EP}"
+echo "MAX_MODEL_LEN: ${MAX_MODEL_LEN}"
+echo "EXTRA_ARGS: ${EXTRA_ARGS}"
+echo "========================================"
+
+export ENROOT_DATA_PATH="${SHARED_FS}/.enroot/data"
+mkdir -p "${ENROOT_DATA_PATH}"
+
+if ! enroot list | grep -q "${CONTAINER_NAME}"; then
+    enroot create -n "${CONTAINER_NAME}" "${SQSH_FILE}"
+fi
+
+mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TORCH_HOME}/kernels" "${TRITON_CACHE_DIR}" "${XDG_CACHE_HOME}" "${CUDA_CACHE_PATH}"
+
+if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
+    num_gpus=$(nvidia-smi -L | wc -l)
+    export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((num_gpus - 1)))
+fi
+
+env_args=""
+prefixes=("NCCL" "CUDA" "SHARED" "HF" "WANDB" "XDG" "LOG" "CACHE" "TORCH" "TRITON" "VLLM")
+for prefix in "${prefixes[@]}"; do
+    while IFS= read -r var; do
+        if [ -n "${!var}" ]; then
+            env_args="${env_args} --env=${var}=${!var}"
+        fi
+    done < <(env | grep "^${prefix}_" | cut -d'=' -f1)
+done
+
+MODEL_NAME="zai-org/GLM-4.6"
+SERVED_MODEL_NAME="glm-4.6-exp"
+PORT=8003
+
+# Build vLLM command arguments
+VLLM_ARGS="--model ${MODEL_NAME}"
+VLLM_ARGS="${VLLM_ARGS} --served-model-name ${SERVED_MODEL_NAME}"
+VLLM_ARGS="${VLLM_ARGS} --tensor-parallel-size 8"
+VLLM_ARGS="${VLLM_ARGS} --dtype bfloat16"
+VLLM_ARGS="${VLLM_ARGS} --kv-cache-dtype fp8"
+VLLM_ARGS="${VLLM_ARGS} --gpu-memory-utilization 0.95"
+VLLM_ARGS="${VLLM_ARGS} --port ${PORT}"
+VLLM_ARGS="${VLLM_ARGS} --max-model-len ${MAX_MODEL_LEN}"
+VLLM_ARGS="${VLLM_ARGS} --max-num-seqs 8"
+VLLM_ARGS="${VLLM_ARGS} --max-num-batched-tokens ${MAX_MODEL_LEN}"
+VLLM_ARGS="${VLLM_ARGS} --enable-chunked-prefill"
+VLLM_ARGS="${VLLM_ARGS} --enable-prefix-caching"
+VLLM_ARGS="${VLLM_ARGS} --swap-space 32"
+VLLM_ARGS="${VLLM_ARGS} --trust-remote-code"
+
+if [ "${ENFORCE_EAGER}" = "yes" ]; then
+    VLLM_ARGS="${VLLM_ARGS} --enforce-eager"
+fi
+
+if [ "${ENABLE_EP}" = "yes" ]; then
+    VLLM_ARGS="${VLLM_ARGS} --enable-expert-parallel"
+fi
+
+VLLM_ARGS="${VLLM_ARGS} ${EXTRA_ARGS}"
+
+echo "Starting vLLM with arguments: ${VLLM_ARGS}"
+
+# Start server in background
+enroot start --root --rw \
+    --mount="${HOME}:${HOME}" \
+    --mount="${SHARED_FS}:${SHARED_FS}" \
+    ${env_args} \
+    ${CONTAINER_NAME} \
+    ${VLLM_ARGS} 2>&1 &
+
+SERVER_PID=$!
+
+# Wait for server to be ready (max 10 minutes)
+echo "Waiting for server to start..."
+for i in {1..60}; do
+    if curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
+        echo "Server is ready after $((i * 10)) seconds"
+        break
+    fi
+    sleep 10
+done
+
+if ! curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
+    echo "ERROR: Server failed to start"
+    kill $SERVER_PID 2>/dev/null || true
+    exit 1
+fi
+
+echo "Server running on $(hostname):${PORT}"
+echo "Experiment: ${EXP_NAME}"
+
+# Run benchmark
+BENCHMARK_DIR="${SHARED_FS}/source_files/Mech/mech-util/local_model_server"
+DATASET_DIR="${SHARED_FS}/source_files/Mech/storage/samples/glm46_benchmark"
+
+python3 ${BENCHMARK_DIR}/benchmark_runner.py \
+    --base-url "http://$(hostname):${PORT}" \
+    --model "${SERVED_MODEL_NAME}" \
+    --dataset "${DATASET_DIR}/dataset_8k.json" \
+    --samples 3 \
+    --config-name "${EXP_NAME}" \
+    --output "${LOG_DIR}/results_8k.json"
+
+# For long context experiments, also test with 64k dataset
+if [ "${MAX_MODEL_LEN}" -ge 65536 ]; then
+    python3 ${BENCHMARK_DIR}/benchmark_runner.py \
+        --base-url "http://$(hostname):${PORT}" \
+        --model "${SERVED_MODEL_NAME}" \
+        --dataset "${DATASET_DIR}/dataset_64k.json" \
+        --samples 2 \
+        --config-name "${EXP_NAME}_64k" \
+        --output "${LOG_DIR}/results_64k.json"
+fi
+
+echo "Benchmark complete. Results in ${LOG_DIR}"
+
+# Keep server running for manual inspection (optional)
+# Comment out the following if you want the job to end after benchmarks
+# wait $SERVER_PID
