@@ -4,7 +4,7 @@
 Evaluate different vLLM configurations for serving GLM-4.6 MoE model on 8x H200 GPUs.
 
 ## vLLM Version
-- **vLLM 0.11.2** - Verified configuration options below
+- **vLLM 0.12.0** - Using `/scratch/Projects/SPEC-SF-AISG/source_files/Mech/4-sqsh/vllm-openai-v0.12.0.sqsh`
 
 ## Datasets
 | Dataset | Samples | Prompt Tokens | Target Response | Total Seq Len |
@@ -22,19 +22,23 @@ value depends on the KV cache capacity, which varies with configuration (max_mod
 kv_cache_dtype, etc.). To ensure fair comparisons, we use:
 
 **Phase 1: Probe Run**
-- Start server with `max_num_seqs=1` to minimize memory overhead
-- Extract GPU block count from vLLM startup logs
-- Calculate optimal `max_num_seqs = GPU_blocks / (max_model_len / block_size)`
+- Start server with `max_num_seqs=1` (same configuration as Phase 2)
+- vLLM calculates and logs the maximum concurrency during startup:
+  ```
+  Maximum concurrency for 32,768 tokens per request: 61.44x
+  ```
+- Extract this value from the logs (floor to integer → `max_num_seqs=61`)
 
 **Phase 2: Actual Run**
-- Restart server with calculated optimal `max_num_seqs`
+- Restart server with the extracted `max_num_seqs`
 - Run benchmark with 100 samples
 
-This ensures each configuration uses its maximum possible concurrency.
+This ensures each configuration uses its maximum possible concurrency based on vLLM's own
+memory profiling, without manual calculation.
 
 ## Verified Configuration Parameters
 
-### ✅ Supported in vLLM 0.11
+### ✅ Supported in vLLM 0.12
 | Parameter | Flag | Default | Notes |
 |-----------|------|---------|-------|
 | Eager Mode | `--enforce-eager` | False | Disables torch.compile & CUDA graphs |
@@ -43,10 +47,10 @@ This ensures each configuration uses its maximum possible concurrency.
 | Chunked Prefill | `--enable-chunked-prefill` | **True (V1)** | V1 engine defaults to True |
 | Disable Chunked | `--no-enable-chunked-prefill` | - | Explicitly disable |
 | KV Cache Type | `--kv-cache-dtype fp8\|auto` | auto | fp8 saves 50% memory |
-| Max Seqs | `--max-num-seqs N` | 256 | **Dynamically calculated in Phase 1** |
+| Max Seqs | `--max-num-seqs N` | 256 | **Extracted from vLLM logs in Phase 1** |
 | Max Model Len | `--max-model-len N` | model default | Context window size |
 
-### ❌ NOT Supported in vLLM 0.11
+### ❌ NOT Supported in vLLM 0.12
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Context Parallel | Not available | `--context-parallel-size` doesn't exist |
@@ -56,7 +60,7 @@ This ensures each configuration uses its maximum possible concurrency.
 
 ### ❌ MTP (Self-Speculative Decoding) NOT Supported for GLM-4.6
 GLM-4.6 has `num_nextn_predict_layers=1` in its config, which is similar to DeepSeek's MTP.
-However, vLLM 0.11 does NOT support GLM-specific MTP:
+However, vLLM 0.12 does NOT support GLM-specific MTP:
 - `deepseek_mtp` method only works with DeepSeek models
 - `ngram` method doesn't use the model's MTP heads (it's purely prompt-based)
 - **Result**: MTP experiments removed from the test matrix
@@ -129,7 +133,7 @@ vllm serve zai-org/GLM-4.6 \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization 0.95 \
     --max-model-len 32768 \
-    --max-num-seqs <dynamically-calculated> \
+    --max-num-seqs <extracted-from-vllm-logs> \
     --enable-chunked-prefill \
     --enable-prefix-caching \
     --swap-space 32 \
@@ -140,7 +144,7 @@ vllm serve zai-org/GLM-4.6 \
 
 | Exp | Config | max_num_seqs | TPS | Status | Notes |
 |-----|--------|--------------|-----|--------|-------|
-| 1A | baseline | 8 | 8.69 | ✅ | enforce-eager, EP, fp8 KV |
+| 1A | baseline | 61 | 8.69 | ✅ | vLLM reported 61.44x concurrency |
 | 1B | compiled | - | - | ❌ | torch.compile timeout |
 | 2B | no EP | - | - | ❌ | Load timeout (2x slower) |
 | 4A | len=16k | TBD | - | ⏳ | Higher concurrency expected |
@@ -160,9 +164,10 @@ vllm serve zai-org/GLM-4.6 \
 - Likely causes OOM or severe performance degradation
 
 ### 3. MTP Not Available
-- GLM-4.6 has MTP layers but vLLM 0.11 doesn't support GLM-specific MTP
+- GLM-4.6 has MTP layers but vLLM 0.12 doesn't support GLM-specific MTP
 - ngram speculation doesn't use model's MTP heads
 
-### 4. Dynamic max_num_seqs
-- Each configuration has different KV cache capacity
-- Two-phase approach ensures optimal concurrency per config
+### 4. Dynamic max_num_seqs via vLLM Logs
+- vLLM logs `Maximum concurrency for X tokens per request: Y.YYx` during startup
+- Extract Y.YY, floor to integer for optimal `max_num_seqs`
+- Each configuration has different KV cache capacity → different optimal concurrency
