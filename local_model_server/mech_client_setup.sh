@@ -13,6 +13,9 @@ SQSH_DIR="/scratch_aisg/SPEC-SF-AISG/sqsh"
 if [ "${CLIENT_NAME}" = "client_component" ] || [ "${CLIENT_NAME}" = "client_assembly" ]; then
     SQSH_FILE="${SQSH_DIR}/freecad_py310_v1.sqsh"
     CONTAINER_NAME="freecad"
+elif [ "${CLIENT_NAME}" = "client_simulation" ]; then
+    SQSH_FILE="${SQSH_DIR}/calculix_py310_v1.sqsh"
+    CONTAINER_NAME="calculix"
 else
     SQSH_FILE="${SQSH_DIR}/vllm_mech_v2.sqsh"
     CONTAINER_NAME="vllm_mech"
@@ -53,10 +56,20 @@ if ! command -v unsquashfs &> /dev/null; then
     fi
 fi
 
+# Check if sqsh file exists
+if [ ! -f "${SQSH_FILE}" ]; then
+    echo "ERROR: SQSH file not found: ${SQSH_FILE}"
+    exit 1
+fi
+echo "✓ SQSH file found: ${SQSH_FILE}"
+
 # Create container if it doesn't exist
-if ! enroot list | grep -q "${CONTAINER_NAME}"; then
-    echo "Creating enroot container: ${CONTAINER_NAME}"
-    enroot create -n "${CONTAINER_NAME}" "${SQSH_FILE}"
+if ! enroot list 2>/dev/null | grep -q "^${CONTAINER_NAME}$"; then
+    echo "Creating enroot container: ${CONTAINER_NAME} from ${SQSH_FILE}"
+    enroot create -n "${CONTAINER_NAME}" "${SQSH_FILE}" || {
+        echo "ERROR: Failed to create container ${CONTAINER_NAME}"
+        exit 1
+    }
     
     # Wait for container extraction to complete and verify /root exists
     CONTAINER_ROOT="${ENROOT_DATA_PATH}/${CONTAINER_NAME}/root"
@@ -90,9 +103,12 @@ export SERVER_NODE_VLM="${SERVER_NODE_VLM:-hopper-34}"
 export OPENAI_API_BASE="http://${SERVER_NODE_LLM}:8001"
 export OPENAI_API_BASE2="http://${SERVER_NODE_VLM}:8002"
 
+# Export container name for startup script
+export MECH_CONTAINER_TYPE="${CONTAINER_NAME}"
+
 # Build enroot --env arguments
 env_args=""
-prefixes=("NCCL" "CUDA" "SHARED" "HF" "WANDB" "XDG" "LOG" "CACHE" "TORCH" "TRITON" "VLLM" "OPENAI" "SERVER")
+prefixes=("NCCL" "CUDA" "SHARED" "HF" "WANDB" "XDG" "LOG" "CACHE" "TORCH" "TRITON" "VLLM" "OPENAI" "SERVER" "MECH")
 
 for prefix in "${prefixes[@]}"; do
     while IFS= read -r var; do
@@ -115,10 +131,27 @@ STARTUP_SCRIPT="${HOME}/.container_startup_$$.sh"
 cat > "${STARTUP_SCRIPT}" << 'STARTUPEOF'
 #!/bin/bash
 echo "=================================================="
-echo "Installing mech-design-orchestrator in editable mode..."
+echo "Installing mech packages in editable mode..."
 echo "=================================================="
 
 pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util
+
+# If simulation container, also install simulation-agent-calculix
+if [ "${MECH_CONTAINER_TYPE}" = "calculix" ]; then
+    pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/simulation-agent-calculix[test]
+fi
+
+echo "=================================================="
+echo "Checking tools..."
+echo "=================================================="
+
+# Check if CalculiX is available (for simulation container)
+if command -v ccx &> /dev/null; then
+    echo "✓ CalculiX (ccx) found: $(which ccx)"
+fi
+if command -v gmsh &> /dev/null; then
+    echo "✓ Gmsh found: $(which gmsh)"
+fi
 
 echo "=================================================="
 echo "Checking vLLM servers..."
