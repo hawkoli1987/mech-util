@@ -164,22 +164,28 @@ if [ "${ENABLE_PREFIX_CACHING}" = "yes" ]; then
 fi
 
 # Chunked prefill
+# Note: vLLM V1 engine defaults to chunked prefill enabled
+# We need to explicitly disable it with --no-enable-chunked-prefill
 if [ "${ENABLE_CHUNKED_PREFILL}" = "yes" ]; then
     VLLM_ARGS="${VLLM_ARGS} --enable-chunked-prefill"
+else
+    VLLM_ARGS="${VLLM_ARGS} --no-enable-chunked-prefill"
 fi
 
-# Distributed Context Parallel (DCP)
+# Distributed Context Parallel (DCP) / Sequence Parallelism
+# NOTE: vLLM 0.11 does NOT support --context-parallel-size
+# This feature is not available in this version
+# Skipping DCP configuration - experiments will use standard TP instead
 if [ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]; then
-    VLLM_ARGS="${VLLM_ARGS} --context-parallel-size ${CONTEXT_PARALLEL_SIZE}"
+    echo "WARNING: context-parallel-size=${CONTEXT_PARALLEL_SIZE} requested but not supported in vLLM 0.11"
+    echo "Using standard tensor parallelism only"
 fi
 
-# Multi-Token Prediction (MTP) Speculative Decoding
-# Note: This uses the model's own MTP heads for self-speculative decoding
+# Speculative Decoding (ngram-based)
+# vLLM 0.11 uses --speculative-config with JSON format
+# Note: Use single quotes around the JSON to prevent shell escaping issues
 if [ "${ENABLE_MTP}" = "yes" ]; then
-    VLLM_ARGS="${VLLM_ARGS} --num-speculative-tokens ${MTP_NUM_TOKENS}"
-    VLLM_ARGS="${VLLM_ARGS} --speculative-model [ngram]"
-    # Alternative: use MTP heads if model supports it
-    # VLLM_ARGS="${VLLM_ARGS} --speculative-model-quantization None"
+    VLLM_ARGS="${VLLM_ARGS} --speculative-config '{\"method\": \"ngram\", \"num_speculative_tokens\": ${MTP_NUM_TOKENS}, \"prompt_lookup_max\": ${MTP_NUM_TOKENS}}'"
 fi
 
 # Additional arguments
