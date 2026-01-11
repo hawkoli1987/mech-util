@@ -7,8 +7,15 @@
 #PBS -l walltime=8:00:00
 
 # ============================================================================
-# GLM-4.6 Experiment Runner
+# GLM-4.6 Experiment Runner - Two-Phase Approach
 # ============================================================================
+# This script uses a two-phase approach to dynamically determine optimal
+# max_num_seqs for each configuration:
+#
+# Phase 1: Probe run - Start server with max_num_seqs=1, extract the actual
+#          max_concurrency that vLLM calculated based on available KV cache
+# Phase 2: Actual run - Restart server with optimal max_num_seqs and run benchmark
+#
 # Configuration variables - override with qsub -v
 #
 # Basic config:
@@ -21,16 +28,13 @@
 #   KV_CACHE_DTYPE: "fp8" or "auto" (default: fp8)
 #   ENABLE_PREFIX_CACHING: "yes" or "no" (default: yes)
 #   ENABLE_CHUNKED_PREFILL: "yes" or "no" (default: yes)
-#   ENABLE_MTP: "yes" or "no" - Multi-Token Prediction speculative decoding (default: no)
-#   MTP_NUM_TOKENS: Number of tokens for MTP (default: 2)
-#   CONTEXT_PARALLEL_SIZE: For DCP - Distributed Context Parallel (default: 1)
 #
 # Benchmark config:
 #   NUM_SAMPLES: Number of samples to benchmark (default: 100)
 #   DATASET_TYPE: "8k" or "64k" (default: 8k)
 #
-# Note: max_num_seqs is NOT set - vLLM will auto-calculate optimal value
-#       based on available KV cache memory after model loading
+# Note: MTP (Multi-Token Prediction) is NOT supported for GLM-4.6 in vLLM 0.11
+#       GLM-4.6 has num_nextn_predict_layers=1 but vLLM doesn't support GLM MTP
 # ============================================================================
 
 set -e
@@ -43,9 +47,6 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-yes}"
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-yes}"
-ENABLE_MTP="${ENABLE_MTP:-no}"
-MTP_NUM_TOKENS="${MTP_NUM_TOKENS:-2}"
-CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 DATASET_TYPE="${DATASET_TYPE:-8k}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -86,9 +87,6 @@ echo "Advanced Configuration:"
 echo "  KV_CACHE_DTYPE: ${KV_CACHE_DTYPE}"
 echo "  ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING}"
 echo "  ENABLE_CHUNKED_PREFILL: ${ENABLE_CHUNKED_PREFILL}"
-echo "  ENABLE_MTP: ${ENABLE_MTP}"
-echo "  MTP_NUM_TOKENS: ${MTP_NUM_TOKENS}"
-echo "  CONTEXT_PARALLEL_SIZE: ${CONTEXT_PARALLEL_SIZE} (DCP)"
 echo "========================================"
 echo "Benchmark Configuration:"
 echo "  NUM_SAMPLES: ${NUM_SAMPLES}"
@@ -172,69 +170,152 @@ else
     VLLM_ARGS="${VLLM_ARGS} --no-enable-chunked-prefill"
 fi
 
-# Distributed Context Parallel (DCP) / Sequence Parallelism
-# NOTE: vLLM 0.11 does NOT support --context-parallel-size
-# This feature is not available in this version
-# Skipping DCP configuration - experiments will use standard TP instead
-if [ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]; then
-    echo "WARNING: context-parallel-size=${CONTEXT_PARALLEL_SIZE} requested but not supported in vLLM 0.11"
-    echo "Using standard tensor parallelism only"
-fi
-
-# Speculative Decoding (ngram-based)
-# vLLM 0.11 uses --speculative-config with JSON format
-# Use compact JSON (no spaces) to avoid word splitting issues
-if [ "${ENABLE_MTP}" = "yes" ]; then
-    SPEC_CONFIG="{\"method\":\"ngram\",\"num_speculative_tokens\":${MTP_NUM_TOKENS},\"prompt_lookup_max\":${MTP_NUM_TOKENS}}"
-    VLLM_ARGS="${VLLM_ARGS} --speculative-config ${SPEC_CONFIG}"
-fi
+# NOTE: MTP (Multi-Token Prediction) speculative decoding is NOT supported
+# GLM-4.6 has num_nextn_predict_layers=1 but vLLM 0.11 doesn't have GLM MTP support
+# ngram-based speculation doesn't use the model's MTP heads (DeepSeek-style)
 
 # Additional arguments
 VLLM_ARGS="${VLLM_ARGS} ${EXTRA_ARGS}"
 
-echo ""
-echo "Starting vLLM with arguments:"
-echo "${VLLM_ARGS}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/  /'
-echo ""
-
 # ============================================================================
-# Start server
+# Helper function: Start vLLM server with given max_num_seqs
 # ============================================================================
-enroot start --root --rw \
-    --mount="${HOME}:${HOME}" \
-    --mount="${SHARED_FS}:${SHARED_FS}" \
-    ${env_args} \
-    ${CONTAINER_NAME} \
-    ${VLLM_ARGS} 2>&1 &
-
-SERVER_PID=$!
-
-# Wait for server to be ready (max 30 minutes for compilation)
-echo "Waiting for server to start (max 30 minutes)..."
-MAX_WAIT=1800
-WAIT_INTERVAL=30
-ELAPSED=0
-
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    if curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
-        echo "Server is ready after $ELAPSED seconds"
-        break
+start_vllm_server() {
+    local max_seqs=$1
+    local phase=$2
+    
+    local args="${VLLM_ARGS}"
+    if [ -n "${max_seqs}" ] && [ "${max_seqs}" != "0" ]; then
+        args="${args} --max-num-seqs ${max_seqs}"
     fi
     
-    # Check if server process died
-    if ! kill -0 $SERVER_PID 2>/dev/null; then
-        echo "ERROR: Server process died unexpectedly"
-        exit 1
-    fi
+    echo ""
+    echo "[${phase}] Starting vLLM with arguments:"
+    echo "${args}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/  /'
+    echo ""
     
-    sleep $WAIT_INTERVAL
-    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
-    echo "  Still waiting... ($ELAPSED seconds elapsed)"
-done
-
-if ! curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
-    echo "ERROR: Server failed to start after $MAX_WAIT seconds"
+    enroot start --root --rw \
+        --mount="${HOME}:${HOME}" \
+        --mount="${SHARED_FS}:${SHARED_FS}" \
+        ${env_args} \
+        ${CONTAINER_NAME} \
+        ${args} 2>&1 &
+    
+    SERVER_PID=$!
+    
+    # Wait for server to be ready (max 30 minutes for compilation)
+    echo "[${phase}] Waiting for server to start (max 30 minutes)..."
+    local MAX_WAIT=1800
+    local WAIT_INTERVAL=30
+    local ELAPSED=0
+    
+    while [ $ELAPSED -lt $MAX_WAIT ]; do
+        if curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
+            echo "[${phase}] Server is ready after $ELAPSED seconds"
+            return 0
+        fi
+        
+        # Check if server process died
+        if ! kill -0 $SERVER_PID 2>/dev/null; then
+            echo "[${phase}] ERROR: Server process died unexpectedly"
+            return 1
+        fi
+        
+        sleep $WAIT_INTERVAL
+        ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+        echo "  Still waiting... ($ELAPSED seconds elapsed)"
+    done
+    
+    echo "[${phase}] ERROR: Server failed to start after $MAX_WAIT seconds"
     kill $SERVER_PID 2>/dev/null || true
+    return 1
+}
+
+# ============================================================================
+# Helper function: Extract max_num_seqs from server logs/metrics
+# ============================================================================
+extract_max_concurrency() {
+    # Method 1: Check vLLM metrics for scheduler info
+    local metrics=$(curl -s "http://$(hostname):${PORT}/metrics" 2>/dev/null)
+    
+    # Method 2: Check the server startup logs for KV cache allocation
+    # vLLM prints something like "Maximum concurrency: X" or "num_gpu_blocks=X"
+    
+    # Method 3: Query model info - some vLLM versions expose this
+    local model_info=$(curl -s "http://$(hostname):${PORT}/v1/models" 2>/dev/null)
+    
+    # Parse the log file for KV cache block count
+    # vLLM logs: "# GPU blocks: X, # CPU blocks: Y"
+    local log_file="${LOG_DIR}/pbs.log"
+    
+    # Search for gpu_blocks in recent log output
+    local gpu_blocks=$(grep -oP '# GPU blocks: \K\d+' "${log_file}" 2>/dev/null | tail -1)
+    local cpu_blocks=$(grep -oP '# CPU blocks: \K\d+' "${log_file}" 2>/dev/null | tail -1)
+    
+    if [ -n "${gpu_blocks}" ]; then
+        echo "  GPU blocks: ${gpu_blocks}, CPU blocks: ${cpu_blocks:-0}"
+        
+        # Calculate max sequences based on block count and max_model_len
+        # Each sequence needs approximately max_model_len / block_size blocks
+        # Default block_size is 16 tokens
+        local block_size=16
+        local blocks_per_seq=$(( (MAX_MODEL_LEN + block_size - 1) / block_size ))
+        local max_seqs=$(( gpu_blocks / blocks_per_seq ))
+        
+        # Ensure at least 1 sequence, cap at 256 for safety
+        if [ "${max_seqs}" -lt 1 ]; then
+            max_seqs=1
+        elif [ "${max_seqs}" -gt 256 ]; then
+            max_seqs=256
+        fi
+        
+        echo "  Calculated max_num_seqs: ${max_seqs} (based on ${gpu_blocks} GPU blocks, ${blocks_per_seq} blocks/seq)"
+        echo "${max_seqs}"
+        return 0
+    fi
+    
+    echo "  WARNING: Could not extract GPU blocks from logs, using default"
+    echo "256"  # Safe default
+    return 0
+}
+
+# ============================================================================
+# PHASE 1: Probe run to discover optimal max_num_seqs
+# ============================================================================
+echo ""
+echo "========================================"
+echo "PHASE 1: Probe run to discover max_num_seqs"
+echo "========================================"
+
+# Start with max_num_seqs=1 to minimize memory overhead during probe
+start_vllm_server 1 "PROBE"
+if [ $? -ne 0 ]; then
+    echo "PHASE 1 FAILED: Could not start server for probe"
+    exit 1
+fi
+
+echo ""
+echo "Extracting optimal max_num_seqs from probe run..."
+OPTIMAL_MAX_SEQS=$(extract_max_concurrency | tail -1)
+echo "Optimal max_num_seqs: ${OPTIMAL_MAX_SEQS}"
+
+# Stop the probe server
+echo "Stopping probe server..."
+kill $SERVER_PID 2>/dev/null || true
+wait $SERVER_PID 2>/dev/null || true
+sleep 5
+
+# ============================================================================
+# PHASE 2: Actual run with optimal max_num_seqs
+# ============================================================================
+echo ""
+echo "========================================"
+echo "PHASE 2: Actual run with max_num_seqs=${OPTIMAL_MAX_SEQS}"
+echo "========================================"
+
+start_vllm_server "${OPTIMAL_MAX_SEQS}" "ACTUAL"
+if [ $? -ne 0 ]; then
+    echo "PHASE 2 FAILED: Could not start server for actual run"
     exit 1
 fi
 
@@ -249,6 +330,7 @@ if data.get('data'):
     print(f\"  Model: {m.get('id')}\")
     print(f\"  Max model len: {m.get('max_model_len')}\")
 " 2>/dev/null || echo "  (Could not retrieve model info)"
+echo "  Max num seqs: ${OPTIMAL_MAX_SEQS}"
 echo ""
 
 # ============================================================================

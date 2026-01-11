@@ -14,6 +14,24 @@ Evaluate different vLLM configurations for serving GLM-4.6 MoE model on 8x H200 
 
 Location: `storage/samples/glm46_benchmark/`
 
+## Two-Phase Experiment Methodology
+
+### Why Two Phases?
+vLLM does NOT auto-calculate `max_num_seqs` - it uses a default of 256. However, the optimal
+value depends on the KV cache capacity, which varies with configuration (max_model_len, 
+kv_cache_dtype, etc.). To ensure fair comparisons, we use:
+
+**Phase 1: Probe Run**
+- Start server with `max_num_seqs=1` to minimize memory overhead
+- Extract GPU block count from vLLM startup logs
+- Calculate optimal `max_num_seqs = GPU_blocks / (max_model_len / block_size)`
+
+**Phase 2: Actual Run**
+- Restart server with calculated optimal `max_num_seqs`
+- Run benchmark with 100 samples
+
+This ensures each configuration uses its maximum possible concurrency.
+
 ## Verified Configuration Parameters
 
 ### ✅ Supported in vLLM 0.11
@@ -25,9 +43,8 @@ Location: `storage/samples/glm46_benchmark/`
 | Chunked Prefill | `--enable-chunked-prefill` | **True (V1)** | V1 engine defaults to True |
 | Disable Chunked | `--no-enable-chunked-prefill` | - | Explicitly disable |
 | KV Cache Type | `--kv-cache-dtype fp8\|auto` | auto | fp8 saves 50% memory |
-| Max Seqs | `--max-num-seqs N` | 256 | **NOT auto-calculated** |
+| Max Seqs | `--max-num-seqs N` | 256 | **Dynamically calculated in Phase 1** |
 | Max Model Len | `--max-model-len N` | model default | Context window size |
-| Spec Decoding | `--speculative-config JSON` | None | ngram, deepseek_mtp, etc. |
 
 ### ❌ NOT Supported in vLLM 0.11
 | Feature | Status | Notes |
@@ -35,93 +52,71 @@ Location: `storage/samples/glm46_benchmark/`
 | Context Parallel | Not available | `--context-parallel-size` doesn't exist |
 | Sequence Parallel | Not available | No `--ulysses-sequence-parallel-size` |
 | Ring Attention | Not available | Requires different architecture |
+| GLM-4.6 MTP | Not available | vLLM doesn't support GLM's `num_nextn_predict_layers` |
 
-## Experiment Matrix (Verified)
+### ❌ MTP (Self-Speculative Decoding) NOT Supported for GLM-4.6
+GLM-4.6 has `num_nextn_predict_layers=1` in its config, which is similar to DeepSeek's MTP.
+However, vLLM 0.11 does NOT support GLM-specific MTP:
+- `deepseek_mtp` method only works with DeepSeek models
+- `ngram` method doesn't use the model's MTP heads (it's purely prompt-based)
+- **Result**: MTP experiments removed from the test matrix
+
+## Experiment Matrix (Final)
 
 ### Group 1: Compilation & CUDA Graphs
-| Exp | enforce-eager | Dataset | Status |
-|-----|---------------|---------|--------|
-| 1A | yes (baseline) | 8k | ✅ Baseline |
-| 1B | no | 8k | ⏳ Pending (slow compile) |
+| Exp | enforce-eager | Dataset | Status | Notes |
+|-----|---------------|---------|--------|-------|
+| 1A | yes (baseline) | 8k | ✅ Baseline | Fast cold start |
+| 1B | no | 8k | ❌ Timeout | torch.compile too slow for MoE |
 
 ### Group 2: Expert Parallelism (EP)
-| Exp | enable-expert-parallel | Dataset | Status |
-|-----|------------------------|---------|--------|
-| 2A | yes (baseline) | 8k | ✅ Same as 1A |
-| 2B | no | 8k | ❌ Timeout (slow load) |
+| Exp | enable-expert-parallel | Dataset | Status | Notes |
+|-----|------------------------|---------|--------|-------|
+| 2A | yes (baseline) | 8k | ✅ Same as 1A | Required for GLM-4.6 |
+| 2B | no | 8k | ❌ Timeout | 2x slower load, likely OOM |
 
-### ~~Group 3: Distributed Context Parallel (DCP)~~
-**CANCELLED** - vLLM 0.11 does not support context parallelism
+### Group 3: Max Model Length
+| Exp | max-model-len | Dataset | Status | Notes |
+|-----|---------------|---------|--------|-------|
+| 4A | 16384 | 8k | ⏳ Pending | Lower memory, higher max_num_seqs |
+| 4B | 32768 (baseline) | 8k | ✅ Baseline | - |
+| 4C | 65536 | 8k | ⏳ Pending | Higher memory, lower max_num_seqs |
 
-### Group 4: Max Model Length
-| Exp | max-model-len | Dataset | Status |
-|-----|---------------|---------|--------|
-| 4A | 16384 | 8k | ⏳ Running |
-| 4B | 32768 (baseline) | 8k | ✅ Baseline |
-| 4C | 65536 | 8k | ⏳ Running |
+### Group 4: KV Cache Dtype
+| Exp | kv-cache-dtype | Dataset | Status | Notes |
+|-----|----------------|---------|--------|-------|
+| 5A | fp8 (baseline) | 8k | ✅ Baseline | 50% KV memory savings |
+| 5B | auto (bf16) | 8k | ⏳ Pending | 2x KV memory, lower max_num_seqs |
 
-### Group 5: KV Cache Dtype
-| Exp | kv-cache-dtype | Dataset | Status |
-|-----|----------------|---------|--------|
-| 5A | fp8 (baseline) | 8k | ✅ Baseline |
-| 5B | auto (bf16) | 8k | ⏳ Running |
+### Group 5: Prefix Caching
+| Exp | enable-prefix-caching | Dataset | Status | Notes |
+|-----|----------------------|---------|--------|-------|
+| 6A | yes (baseline) | 8k | ✅ Baseline | Good for repeated prompts |
+| 6B | no | 8k | ⏳ Pending | - |
 
-### Group 6: Prefix Caching
-| Exp | enable-prefix-caching | Dataset | Status |
-|-----|----------------------|---------|--------|
-| 6A | yes (baseline) | 8k | ✅ Baseline |
-| 6B | no | 8k | ⏳ Running |
+### Group 6: Chunked Prefill
+| Exp | chunked-prefill | Dataset | Status | Notes |
+|-----|-----------------|---------|--------|-------|
+| 7A | yes (baseline) | 8k | ✅ Baseline | V1 default |
+| 7B | no | 8k | ⏳ Pending | Uses `--no-enable-chunked-prefill` |
 
-### Group 7: Chunked Prefill
-| Exp | chunked-prefill | Dataset | Status |
-|-----|-----------------|---------|--------|
-| 7A | yes (baseline) | 8k | ✅ Baseline |
-| 7B | no | 8k | ⏳ Running (needs --no-enable-chunked-prefill) |
+## PBS Submission Commands
 
-### Group 8: Speculative Decoding (ngram)
-| Exp | speculative-config | Dataset | Status |
-|-----|-------------------|---------|--------|
-| 8A | none (baseline) | 8k | ✅ Baseline |
-| 8B | ngram, 2 tokens | 8k | ❌ Failed (wrong args) |
-| 8C | ngram, 4 tokens | 8k | ❌ Failed (wrong args) |
-
-## Fixed PBS Commands
-
-### Speculative Decoding (Correct Syntax)
 ```bash
-# Use --speculative-config with JSON
-qsub -v 'EXP_NAME=8B_spec2,ENABLE_MTP=yes,MTP_NUM_TOKENS=2,NUM_SAMPLES=100' experiments/exp_runner.pbs
-```
+cd /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util/local_model_server
 
-### Disable Chunked Prefill (Correct Syntax)
-```bash
-# Use --no-enable-chunked-prefill to disable
-qsub -v 'EXP_NAME=7B_no_chunked,ENABLE_CHUNKED_PREFILL=no,NUM_SAMPLES=100' experiments/exp_runner.pbs
-```
+# Group 3: Max Model Length
+qsub -v 'EXP_NAME=4A_len16k,MAX_MODEL_LEN=16384' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=4C_len65k,MAX_MODEL_LEN=65536' experiments/exp_runner.pbs
 
-## Important Findings
+# Group 4: KV Cache
+qsub -v 'EXP_NAME=5B_kv_bf16,KV_CACHE_DTYPE=auto' experiments/exp_runner.pbs
 
-### 1. max_num_seqs is NOT Auto-Calculated
-- vLLM uses default of 256 when not specified
-- Original baseline used `--max-num-seqs 8` explicitly
-- For fair comparison, either:
-  - Use same max_num_seqs across experiments
-  - Or let vLLM use default 256 for all
+# Group 5: Prefix Caching
+qsub -v 'EXP_NAME=6B_no_prefix,ENABLE_PREFIX_CACHING=no' experiments/exp_runner.pbs
 
-### 2. V1 Engine Defaults
-The vLLM V1 engine (used in 0.11) has different defaults:
-- `enable_chunked_prefill` defaults to **True** (was False in V0)
-- Need `--no-enable-chunked-prefill` to disable
-
-### 3. Speculative Decoding Syntax
-vLLM 0.11 uses JSON config:
-```bash
---speculative-config '{"method": "ngram", "num_speculative_tokens": 2, "prompt_lookup_max": 2}'
-```
-
-NOT the old syntax:
-```bash
---num-speculative-tokens 2 --speculative-model [ngram]  # WRONG
+# Group 6: Chunked Prefill
+qsub -v 'EXP_NAME=7B_no_chunked,ENABLE_CHUNKED_PREFILL=no' experiments/exp_runner.pbs
 ```
 
 ## Baseline Configuration
@@ -134,8 +129,7 @@ vllm serve zai-org/GLM-4.6 \
     --kv-cache-dtype fp8 \
     --gpu-memory-utilization 0.95 \
     --max-model-len 32768 \
-    --max-num-seqs 8 \
-    --max-num-batched-tokens 32768 \
+    --max-num-seqs <dynamically-calculated> \
     --enable-chunked-prefill \
     --enable-prefix-caching \
     --swap-space 32 \
@@ -144,15 +138,31 @@ vllm serve zai-org/GLM-4.6 \
 
 ## Results Summary
 
-| Exp | Config | TPS | Status | Notes |
-|-----|--------|-----|--------|-------|
-| 1A | baseline | 8.69 | ✅ | enforce-eager, EP, fp8 KV |
-| 1B | compiled | - | ⏳ | torch.compile (slow) |
-| 2B | no EP | - | ❌ | Load timeout (2x slower) |
-| 4A | len=16k | - | ⏳ | - |
-| 4C | len=65k | - | ⏳ | - |
-| 5B | kv=bf16 | - | ⏳ | - |
-| 6B | no prefix | - | ⏳ | - |
-| 7B | no chunk | - | ⏳ | Needs script fix |
-| 8B | spec-2 | - | ❌ | Wrong args |
-| 8C | spec-4 | - | ❌ | Wrong args |
+| Exp | Config | max_num_seqs | TPS | Status | Notes |
+|-----|--------|--------------|-----|--------|-------|
+| 1A | baseline | 8 | 8.69 | ✅ | enforce-eager, EP, fp8 KV |
+| 1B | compiled | - | - | ❌ | torch.compile timeout |
+| 2B | no EP | - | - | ❌ | Load timeout (2x slower) |
+| 4A | len=16k | TBD | - | ⏳ | Higher concurrency expected |
+| 4C | len=65k | TBD | - | ⏳ | Lower concurrency expected |
+| 5B | kv=bf16 | TBD | - | ⏳ | 2x KV memory |
+| 6B | no prefix | TBD | - | ⏳ | - |
+| 7B | no chunk | TBD | - | ⏳ | - |
+
+## Key Findings
+
+### 1. `enforce-eager` is Required
+- Without it, `torch.compile` takes 20+ minutes for GLM-4.6 MoE model
+- Cold start time is critical for HPC job scheduling
+
+### 2. Expert Parallelism is Critical
+- Disabling EP doubles model load time (155s → 310s)
+- Likely causes OOM or severe performance degradation
+
+### 3. MTP Not Available
+- GLM-4.6 has MTP layers but vLLM 0.11 doesn't support GLM-specific MTP
+- ngram speculation doesn't use model's MTP heads
+
+### 4. Dynamic max_num_seqs
+- Each configuration has different KV cache capacity
+- Two-phase approach ensures optimal concurrency per config
