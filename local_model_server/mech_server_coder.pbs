@@ -20,8 +20,9 @@ export HF_HOME="${SHARED_FS}/cache/huggingface_tmp" # defaults to non_tmp
 export VLLM_CACHE_ROOT="$CACHE_ROOT/vllm_cache"
 export TORCH_HOME="$CACHE_ROOT/torch_cache"
 export TORCH_KERNEL_CACHE_PATH="$CACHE_ROOT/torch_cache/kernels"
-# Use per-job Triton cache to avoid race conditions with multi-GPU workers
-export TRITON_CACHE_DIR="$CACHE_ROOT/triton_cache_glm46_${PBS_JOBID:-$$}"
+# Use local /tmp for Triton cache to avoid race conditions on shared filesystem
+# /tmp is local to the compute node and supports executable files
+export TRITON_CACHE_DIR="/tmp/triton_cache_${PBS_JOBID:-$$}"
 export XDG_CACHE_HOME="$CACHE_ROOT/xdg_cache"
 export CUDA_CACHE_PATH="$CACHE_ROOT/cuda_cache"
 
