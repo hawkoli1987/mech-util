@@ -49,11 +49,18 @@ memory profiling, without manual calculation.
 | KV Cache Type | `--kv-cache-dtype fp8\|auto` | auto | fp8 saves 50% memory |
 | Max Seqs | `--max-num-seqs N` | 256 | **Extracted from vLLM logs in Phase 1** |
 | Max Model Len | `--max-model-len N` | model default | Context window size |
+| **DCP** | `--decode-context-parallel-size N` | 1 | Shards KV cache across GPUs |
+
+### ✅ DCP (Decoder Context Parallelism) - NEW in vLLM 0.12
+DCP shards the KV cache across multiple GPUs during the decoding phase:
+- Increases total KV cache capacity
+- Improves memory efficiency for long contexts
+- Valid values: 1, 2, 4, 8 (must divide `tensor_parallel_size=8`)
+- Best for 64k+ context workloads
 
 ### ❌ NOT Supported in vLLM 0.12
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Context Parallel | Not available | `--context-parallel-size` doesn't exist |
 | Sequence Parallel | Not available | No `--ulysses-sequence-parallel-size` |
 | Ring Attention | Not available | Requires different architecture |
 | GLM-4.6 MTP | Not available | vLLM doesn't support GLM's `num_nextn_predict_layers` |
@@ -82,27 +89,34 @@ However, vLLM 0.12 does NOT support GLM-specific MTP:
 ### Group 3: Max Model Length
 | Exp | max-model-len | Dataset | Status | Notes |
 |-----|---------------|---------|--------|-------|
-| 4A | 16384 | 8k | ⏳ Pending | Lower memory, higher max_num_seqs |
-| 4B | 32768 (baseline) | 8k | ✅ Baseline | - |
-| 4C | 65536 | 8k | ⏳ Pending | Higher memory, lower max_num_seqs |
+| 3A | 16384 | 8k | ⏳ Pending | Lower memory, higher max_num_seqs |
+| 3B | 32768 (baseline) | 8k | ✅ Baseline | - |
+| 3C | 65536 | 8k | ⏳ Pending | Higher memory, lower max_num_seqs |
 
 ### Group 4: KV Cache Dtype
 | Exp | kv-cache-dtype | Dataset | Status | Notes |
 |-----|----------------|---------|--------|-------|
-| 5A | fp8 (baseline) | 8k | ✅ Baseline | 50% KV memory savings |
-| 5B | auto (bf16) | 8k | ⏳ Pending | 2x KV memory, lower max_num_seqs |
+| 4A | fp8 (baseline) | 8k | ✅ Baseline | 50% KV memory savings |
+| 4B | auto (bf16) | 8k | ⏳ Pending | 2x KV memory, lower max_num_seqs |
 
 ### Group 5: Prefix Caching
 | Exp | enable-prefix-caching | Dataset | Status | Notes |
 |-----|----------------------|---------|--------|-------|
-| 6A | yes (baseline) | 8k | ✅ Baseline | Good for repeated prompts |
-| 6B | no | 8k | ⏳ Pending | - |
+| 5A | yes (baseline) | 8k | ✅ Baseline | Good for repeated prompts |
+| 5B | no | 8k | ⏳ Pending | - |
 
 ### Group 6: Chunked Prefill
 | Exp | chunked-prefill | Dataset | Status | Notes |
 |-----|-----------------|---------|--------|-------|
-| 7A | yes (baseline) | 8k | ✅ Baseline | V1 default |
-| 7B | no | 8k | ⏳ Pending | Uses `--no-enable-chunked-prefill` |
+| 6A | yes (baseline) | 8k | ✅ Baseline | V1 default |
+| 6B | no | 8k | ⏳ Pending | Uses `--no-enable-chunked-prefill` |
+
+### Group 7: Decoder Context Parallelism (DCP)
+| Exp | decode-context-parallel-size | max-model-len | Dataset | Status | Notes |
+|-----|------------------------------|---------------|---------|--------|-------|
+| 7A | 1 (baseline) | 65536 | 64k | ⏳ Pending | No DCP, long context |
+| 7B | 2 | 65536 | 64k | ⏳ Pending | DCP=2, KV sharded across 2 GPUs |
+| 7C | 4 | 65536 | 64k | ⏳ Pending | DCP=4, KV sharded across 4 GPUs |
 
 ## PBS Submission Commands
 
@@ -110,17 +124,22 @@ However, vLLM 0.12 does NOT support GLM-specific MTP:
 cd /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util/local_model_server
 
 # Group 3: Max Model Length
-qsub -v 'EXP_NAME=4A_len16k,MAX_MODEL_LEN=16384' experiments/exp_runner.pbs
-qsub -v 'EXP_NAME=4C_len65k,MAX_MODEL_LEN=65536' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=3A_len16k,MAX_MODEL_LEN=16384' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=3C_len65k,MAX_MODEL_LEN=65536' experiments/exp_runner.pbs
 
 # Group 4: KV Cache
-qsub -v 'EXP_NAME=5B_kv_bf16,KV_CACHE_DTYPE=auto' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=4B_kv_bf16,KV_CACHE_DTYPE=auto' experiments/exp_runner.pbs
 
 # Group 5: Prefix Caching
-qsub -v 'EXP_NAME=6B_no_prefix,ENABLE_PREFIX_CACHING=no' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=5B_no_prefix,ENABLE_PREFIX_CACHING=no' experiments/exp_runner.pbs
 
 # Group 6: Chunked Prefill
-qsub -v 'EXP_NAME=7B_no_chunked,ENABLE_CHUNKED_PREFILL=no' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=6B_no_chunked,ENABLE_CHUNKED_PREFILL=no' experiments/exp_runner.pbs
+
+# Group 7: DCP (use 64k dataset for long context)
+qsub -v 'EXP_NAME=7A_dcp1_64k,MAX_MODEL_LEN=65536,DECODE_CONTEXT_PARALLEL_SIZE=1,DATASET_TYPE=64k' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=7B_dcp2_64k,MAX_MODEL_LEN=65536,DECODE_CONTEXT_PARALLEL_SIZE=2,DATASET_TYPE=64k' experiments/exp_runner.pbs
+qsub -v 'EXP_NAME=7C_dcp4_64k,MAX_MODEL_LEN=65536,DECODE_CONTEXT_PARALLEL_SIZE=4,DATASET_TYPE=64k' experiments/exp_runner.pbs
 ```
 
 ## Baseline Configuration
@@ -147,11 +166,14 @@ vllm serve zai-org/GLM-4.6 \
 | 1A | baseline | 61 | 8.69 | ✅ | vLLM reported 61.44x concurrency |
 | 1B | compiled | - | - | ❌ | torch.compile timeout |
 | 2B | no EP | - | - | ❌ | Load timeout (2x slower) |
-| 4A | len=16k | TBD | - | ⏳ | Higher concurrency expected |
-| 4C | len=65k | TBD | - | ⏳ | Lower concurrency expected |
-| 5B | kv=bf16 | TBD | - | ⏳ | 2x KV memory |
-| 6B | no prefix | TBD | - | ⏳ | - |
-| 7B | no chunk | TBD | - | ⏳ | - |
+| 3A | len=16k | TBD | - | ⏳ | Higher concurrency expected |
+| 3C | len=65k | TBD | - | ⏳ | Lower concurrency expected |
+| 4B | kv=bf16 | TBD | - | ⏳ | 2x KV memory |
+| 5B | no prefix | TBD | - | ⏳ | - |
+| 6B | no chunk | TBD | - | ⏳ | - |
+| 7A | dcp1,len=65k | TBD | - | ⏳ | Baseline for DCP comparison |
+| 7B | dcp2,len=65k | TBD | - | ⏳ | KV sharded across 2 GPUs |
+| 7C | dcp4,len=65k | TBD | - | ⏳ | KV sharded across 4 GPUs |
 
 ## Key Findings
 
@@ -171,3 +193,8 @@ vllm serve zai-org/GLM-4.6 \
 - vLLM logs `Maximum concurrency for X tokens per request: Y.YYx` during startup
 - Extract Y.YY, floor to integer for optimal `max_num_seqs`
 - Each configuration has different KV cache capacity → different optimal concurrency
+
+### 5. DCP for Long Contexts
+- DCP shards KV cache across GPUs, increasing total capacity
+- Best used with long contexts (64k+) where single-GPU KV cache is insufficient
+- Must divide tensor_parallel_size (8): valid values are 1, 2, 4, 8

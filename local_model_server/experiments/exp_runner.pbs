@@ -28,6 +28,8 @@
 #   KV_CACHE_DTYPE: "fp8" or "auto" (default: fp8)
 #   ENABLE_PREFIX_CACHING: "yes" or "no" (default: yes)
 #   ENABLE_CHUNKED_PREFILL: "yes" or "no" (default: yes)
+#   DECODE_CONTEXT_PARALLEL_SIZE: 1, 2, 4 (default: 1, must divide tensor_parallel_size=8)
+#     DCP (Decoder Context Parallelism) shards KV cache across GPUs for long contexts
 #
 # Benchmark config:
 #   NUM_SAMPLES: Number of samples to benchmark (default: 100)
@@ -47,6 +49,7 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-yes}"
 ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-yes}"
+DECODE_CONTEXT_PARALLEL_SIZE="${DECODE_CONTEXT_PARALLEL_SIZE:-1}"
 NUM_SAMPLES="${NUM_SAMPLES:-100}"
 DATASET_TYPE="${DATASET_TYPE:-8k}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -85,6 +88,7 @@ echo "Advanced Configuration:"
 echo "  KV_CACHE_DTYPE: ${KV_CACHE_DTYPE}"
 echo "  ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING}"
 echo "  ENABLE_CHUNKED_PREFILL: ${ENABLE_CHUNKED_PREFILL}"
+echo "  DECODE_CONTEXT_PARALLEL_SIZE: ${DECODE_CONTEXT_PARALLEL_SIZE} (DCP)"
 echo "========================================"
 echo "Benchmark Configuration:"
 echo "  NUM_SAMPLES: ${NUM_SAMPLES}"
@@ -166,6 +170,12 @@ if [ "${ENABLE_CHUNKED_PREFILL}" = "yes" ]; then
     VLLM_ARGS="${VLLM_ARGS} --enable-chunked-prefill"
 else
     VLLM_ARGS="${VLLM_ARGS} --no-enable-chunked-prefill"
+fi
+
+# Decoder Context Parallelism (DCP) - shards KV cache across GPUs for long contexts
+# Must divide tensor_parallel_size (8), valid values: 1, 2, 4, 8
+if [ "${DECODE_CONTEXT_PARALLEL_SIZE}" -gt 1 ]; then
+    VLLM_ARGS="${VLLM_ARGS} --decode-context-parallel-size ${DECODE_CONTEXT_PARALLEL_SIZE}"
 fi
 
 # NOTE: MTP (Multi-Token Prediction) speculative decoding is NOT supported
