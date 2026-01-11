@@ -4,149 +4,216 @@
 Evaluate different vLLM configurations for serving GLM-4.6 MoE model on 8x H200 GPUs.
 
 ## Datasets
-| Dataset | Prompt Length | Completion | Location |
-|---------|---------------|------------|----------|
-| Dataset 1 (8k) | ~6100 tokens | 512 tokens | `storage/samples/glm46_benchmark/dataset_8k.json` |
-| Dataset 2 (64k) | ~47490 tokens | 512 tokens | `storage/samples/glm46_benchmark/dataset_64k.json` |
+| Dataset | Samples | Prompt Tokens | Target Response | Total Seq Len |
+|---------|---------|---------------|-----------------|---------------|
+| 8k | 100 | ~6K | ~8K | ~14K |
+| 64k | 100 | ~48K | ~64K | ~112K |
 
-## Summary of Results
+Location: `storage/samples/glm46_benchmark/`
 
-| Exp | Config | Dataset | TPS | Latency (s) | Status | Notes |
-|-----|--------|---------|-----|-------------|--------|-------|
-| 1A | enforce-eager=yes, EP=on, len=32k | 8k | **8.69** | 58.9 | ✅ | **Baseline** |
-| 1B | enforce-eager=no, EP=on, len=32k | 8k | - | - | ❌ | Timeout during torch.compile |
-| 3A | enforce-eager=yes, EP=on, len=8k | 8k | 7.93 | 65.8 | ✅ | Slightly slower |
-| 3C | enforce-eager=yes, EP=on, len=65k | 8k | 8.02 | 65.1 | ✅ | Similar to baseline |
-| 3C | enforce-eager=yes, EP=on, len=65k | 64k | **8.54** | 60.0 | ✅ | Works with 64k prompts |
-| 2B | enforce-eager=yes, EP=off, len=32k | 8k | - | - | ❌ | Timeout, loading 2x slower |
+## Experiment Matrix
 
-## Key Findings
+### Group 1: Compilation & CUDA Graphs
+| Exp | enforce-eager | CUDA Graphs | torch.compile | Dataset |
+|-----|---------------|-------------|---------------|---------|
+| 1A | yes (baseline) | disabled | disabled | 8k |
+| 1B | no | enabled | enabled | 8k |
 
-### 1. Eager Mode (`--enforce-eager`)
-- **Recommended: Yes** - Without enforce-eager, torch.compile takes 20+ minutes for MoE models
-- First-run compilation overhead is too high for practical use
-- With cached compilation, performance would improve, but initial startup is problematic
+### Group 2: Expert Parallelism (EP)
+| Exp | enable-expert-parallel | Dataset | Notes |
+|-----|------------------------|---------|-------|
+| 2A | yes (baseline) | 8k | Distributes MoE experts |
+| 2B | no | 8k | Replicates all experts |
 
-### 2. Expert Parallelism (`--enable-expert-parallel`)
-- **Recommended: Yes** - Without EP, model loading is ~2x slower (310s vs 155s)
-- EP distributes MoE experts across GPUs efficiently
-- Without EP, each GPU loads all experts (replication), causing memory and time overhead
-- Experiment 2B timed out due to slow loading
+### Group 3: Distributed Context Parallel (DCP)
+| Exp | context-parallel-size | Dataset | Notes |
+|-----|----------------------|---------|-------|
+| 3A | 1 (baseline) | 8k, 64k | No context parallelism |
+| 3B | 2 | 64k | Splits context across 2 groups |
+| 3C | 4 | 64k | Splits context across 4 groups |
 
-### 3. Max Model Length (`--max-model-len`)
-| max-model-len | 8k Dataset TPS | 64k Dataset | Notes |
-|---------------|----------------|-------------|-------|
-| 8192 | 7.93 | N/A | Slightly slower, more KV cache slots |
-| 32768 (baseline) | 8.69 | N/A | Best for 8k prompts |
-| 65536 | 8.02 / 8.54 | ✅ Works | Needed for 64k context |
+### Group 4: Max Model Length
+| Exp | max-model-len | Dataset | Notes |
+|-----|---------------|---------|-------|
+| 4A | 16384 | 8k | Short context |
+| 4B | 32768 (baseline) | 8k | Medium context |
+| 4C | 65536 | 8k, 64k | Long context |
+| 4D | 131072 | 64k | Ultra-long context |
 
-### 4. Performance Observations
-- Generation TPS is consistent at ~8.7 tokens/s regardless of context length
-- Prompt throughput scales with context: 518-610 tokens/s for 6k prompts, 4749 tokens/s for 47k prompts
-- Prefix caching works well: cache hit rate increases with similar prompts (0% → 50%+)
-- GPU KV cache usage is very low (0.3% for 8k, 2.4% for 64k) - model is not memory-bound
+### Group 5: KV Cache Dtype
+| Exp | kv-cache-dtype | Dataset | Notes |
+|-----|----------------|---------|-------|
+| 5A | fp8 (baseline) | 8k | 8-bit quantized KV cache |
+| 5B | auto (bf16) | 8k | Full precision KV cache |
 
-## Recommended Production Configuration
+### Group 6: Prefix Caching
+| Exp | enable-prefix-caching | Dataset | Notes |
+|-----|----------------------|---------|-------|
+| 6A | yes (baseline) | 8k | Caches common prefixes |
+| 6B | no | 8k | No prefix caching |
 
+### Group 7: Chunked Prefill
+| Exp | enable-chunked-prefill | Dataset | Notes |
+|-----|------------------------|---------|-------|
+| 7A | yes (baseline) | 8k | Chunked prompt processing |
+| 7B | no | 8k | Full prompt processing |
+
+### Group 8: Self-Speculative Decoding (MTP)
+| Exp | Speculative Decoding | num-spec-tokens | Dataset | Notes |
+|-----|---------------------|-----------------|---------|-------|
+| 8A | no (baseline) | - | 8k | Standard decoding |
+| 8B | yes (ngram) | 2 | 8k | 2-token speculation |
+| 8C | yes (ngram) | 4 | 8k | 4-token speculation |
+
+## PBS Commands
+
+### Group 1: Compilation
 ```bash
-# Optimal GLM-4.6 configuration for 8x H200 GPUs
-vllm serve zai-org/GLM-4.6 \
-    --tensor-parallel-size 8 \
-    --enable-expert-parallel \
-    --enforce-eager \
-    --dtype bfloat16 \
-    --kv-cache-dtype fp8 \
-    --gpu-memory-utilization 0.95 \
-    --max-model-len 32768 \      # or 65536 for long context
-    --max-num-seqs 8 \
-    --max-num-batched-tokens 32768 \
-    --enable-chunked-prefill \
-    --enable-prefix-caching \
-    --swap-space 32 \
-    --trust-remote-code
+# 1A: Baseline (already running)
+# 1B: Without enforce-eager
+qsub -v 'EXP_NAME=1B_compiled,ENFORCE_EAGER=no,NUM_SAMPLES=100' experiments/exp_runner.pbs
 ```
 
-## Detailed Results
-
-### Exp 1A: Baseline (enforce-eager=yes, EP=on, len=32k)
-- **Host**: hopper-46:8002
-- **Model Memory**: 82.6 GiB
-- **Results**:
-  | Sample | Prompt Tokens | Completion | Time (s) | TPS |
-  |--------|---------------|------------|----------|-----|
-  | 8k_1 | 6101 | 512 | 59.86 | 8.55 |
-  | 8k_2 | 6101 | 512 | 58.55 | 8.74 |
-  | 8k_3 | 6102 | 512 | 58.32 | 8.78 |
-  | **Avg** | - | - | **58.9** | **8.69** |
-
-### Exp 1B: Without enforce-eager
-- **Host**: hopper-35:8003
-- **Status**: ❌ Failed
-- **Reason**: Server startup timed out during torch.compile
-- **Observations**:
-  - Dynamo bytecode transform: 21.5s
-  - CUDA graph capture would follow, but timed out
-  - torch.compile is not practical for first cold start with MoE models
-
-### Exp 2B: Without Expert Parallelism
-- **Host**: hopper-34
-- **Status**: ❌ Failed
-- **Reason**: Model loading took 310s (2x baseline), then startup timed out
-- **Observations**:
-  - Without EP, all 64 experts are replicated on each GPU
-  - Loading time: 310s vs 155s with EP (2x slower)
-  - Memory usage same (82.6 GiB) but loading inefficient
-
-### Exp 3A: Short Context (len=8192)
-- **Host**: hopper-34:8003
-- **Results**:
-  | Sample | Prompt Tokens | Completion | Time (s) | TPS |
-  |--------|---------------|------------|----------|-----|
-  | 8k_1 | 6101 | 512 | 79.46 | 6.44 |
-  | 8k_2 | 6101 | 512 | 59.07 | 8.67 |
-  | 8k_3 | 6102 | 512 | 58.88 | 8.69 |
-  | **Avg** | - | - | **65.8** | **7.93** |
-- **Notes**: First request slower (cold start), subsequent requests match baseline
-
-### Exp 3C: Long Context (len=65536)
-- **Host**: hopper-36:8003
-- **8k Dataset Results**:
-  | Sample | Prompt Tokens | Completion | Time (s) | TPS |
-  |--------|---------------|------------|----------|-----|
-  | 8k_1 | 6101 | 512 | 78.34 | 6.54 |
-  | 8k_2 | 6101 | 512 | 58.27 | 8.79 |
-  | 8k_3 | 6102 | 512 | 58.69 | 8.72 |
-  | **Avg** | - | - | **65.1** | **8.02** |
-
-- **64k Dataset Results**:
-  | Sample | Prompt Tokens | Completion | Time (s) | TPS |
-  |--------|---------------|------------|----------|-----|
-  | 64k_1 | 47490 | 512 | 61.65 | 8.30 |
-  | 64k_2 | 47490 | 512 | 58.38 | 8.77 |
-  | **Avg** | - | - | **60.0** | **8.54** |
-- **Notes**: Long context works well, generation TPS unaffected by prompt length
-
-## Experiments Not Completed
-
-- **CUDA Graph Capture**: Implicitly tested with 1B (requires enforce-eager=no)
-- **DCP (Distributed Checkpoint)**: vLLM uses default load-format, no separate DCP option
-- **KV Cache Dtype auto**: Not tested (fp8 works well, baseline uses it)
-
-## Appendix: PBS Commands Used
-
+### Group 2: Expert Parallelism
 ```bash
-# Baseline (1A) - running on hopper-46
-qsub mech_server_coder.pbs
-
-# Experiment 1B - without enforce-eager
-qsub -v 'EXP_NAME=1B_no_eager,ENFORCE_EAGER=no,ENABLE_EP=yes,MAX_MODEL_LEN=32768' experiments/exp_runner.pbs
-
-# Experiment 2B - without EP
-qsub -v 'EXP_NAME=2B_no_ep,ENFORCE_EAGER=yes,ENABLE_EP=no,MAX_MODEL_LEN=32768' experiments/exp_runner.pbs
-
-# Experiment 3A - short context
-qsub -v 'EXP_NAME=3A_short_ctx,ENFORCE_EAGER=yes,ENABLE_EP=yes,MAX_MODEL_LEN=8192' experiments/exp_runner.pbs
-
-# Experiment 3C - long context
-qsub -v 'EXP_NAME=3C_long_ctx,ENFORCE_EAGER=yes,ENABLE_EP=yes,MAX_MODEL_LEN=65536' experiments/exp_runner.pbs
+# 2B: Without EP
+qsub -v 'EXP_NAME=2B_no_ep,ENABLE_EP=no,NUM_SAMPLES=100' experiments/exp_runner.pbs
 ```
+
+### Group 3: DCP
+```bash
+# 3B: DCP with 2-way context parallel
+qsub -v 'EXP_NAME=3B_dcp2,CONTEXT_PARALLEL_SIZE=2,MAX_MODEL_LEN=131072,DATASET_TYPE=64k,NUM_SAMPLES=100' experiments/exp_runner.pbs
+
+# 3C: DCP with 4-way context parallel
+qsub -v 'EXP_NAME=3C_dcp4,CONTEXT_PARALLEL_SIZE=4,MAX_MODEL_LEN=131072,DATASET_TYPE=64k,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+### Group 4: Max Model Length
+```bash
+# 4A: Short context
+qsub -v 'EXP_NAME=4A_len16k,MAX_MODEL_LEN=16384,NUM_SAMPLES=100' experiments/exp_runner.pbs
+
+# 4C: Long context
+qsub -v 'EXP_NAME=4C_len65k,MAX_MODEL_LEN=65536,NUM_SAMPLES=100' experiments/exp_runner.pbs
+
+# 4D: Ultra-long context
+qsub -v 'EXP_NAME=4D_len131k,MAX_MODEL_LEN=131072,DATASET_TYPE=64k,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+### Group 5: KV Cache Dtype
+```bash
+# 5B: bf16 KV cache
+qsub -v 'EXP_NAME=5B_kv_bf16,KV_CACHE_DTYPE=auto,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+### Group 6: Prefix Caching
+```bash
+# 6B: No prefix caching
+qsub -v 'EXP_NAME=6B_no_prefix_cache,ENABLE_PREFIX_CACHING=no,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+### Group 7: Chunked Prefill
+```bash
+# 7B: No chunked prefill
+qsub -v 'EXP_NAME=7B_no_chunked,ENABLE_CHUNKED_PREFILL=no,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+### Group 8: MTP Speculative Decoding
+```bash
+# 8B: 2-token speculation
+qsub -v 'EXP_NAME=8B_mtp2,ENABLE_MTP=yes,MTP_NUM_TOKENS=2,NUM_SAMPLES=100' experiments/exp_runner.pbs
+
+# 8C: 4-token speculation
+qsub -v 'EXP_NAME=8C_mtp4,ENABLE_MTP=yes,MTP_NUM_TOKENS=4,NUM_SAMPLES=100' experiments/exp_runner.pbs
+```
+
+## Results Summary
+
+### Baseline Configuration (1A)
+```bash
+--tensor-parallel-size 8
+--enable-expert-parallel
+--enforce-eager
+--dtype bfloat16
+--kv-cache-dtype fp8
+--gpu-memory-utilization 0.95
+--max-model-len 32768
+--enable-chunked-prefill
+--enable-prefix-caching
+--trust-remote-code
+```
+
+| Metric | Value |
+|--------|-------|
+| TPS | 8.69 |
+| Latency | 58.9s |
+| Model Memory | 82.6 GiB |
+| Prompt Tokens | ~6100 |
+| Completion Tokens | 512 (limited in initial tests) |
+
+### Experiment Results Table
+
+| Exp | Config | Dataset | TPS | Latency | Status | Notes |
+|-----|--------|---------|-----|---------|--------|-------|
+| 1A | baseline | 8k | 8.69 | 58.9s | ✅ | Initial baseline (512 tokens) |
+| 1B | compiled | 8k | - | - | ⏳ | Pending rerun with 100 samples |
+| 2B | no EP | 8k | - | - | ⏳ | Pending |
+| 3B | DCP-2 | 64k | - | - | ⏳ | Pending |
+| 3C | DCP-4 | 64k | - | - | ⏳ | Pending |
+| 4A | len=16k | 8k | - | - | ⏳ | Pending |
+| 4C | len=65k | 8k | - | - | ⏳ | Pending |
+| 4D | len=131k | 64k | - | - | ⏳ | Pending |
+| 5B | kv=bf16 | 8k | - | - | ⏳ | Pending |
+| 6B | no prefix | 8k | - | - | ⏳ | Pending |
+| 7B | no chunk | 8k | - | - | ⏳ | Pending |
+| 8B | MTP-2 | 8k | - | - | ⏳ | Pending |
+| 8C | MTP-4 | 8k | - | - | ⏳ | Pending |
+
+## Configuration Parameter Reference
+
+### Core Parameters
+| Parameter | Options | Default | Description |
+|-----------|---------|---------|-------------|
+| `--enforce-eager` | flag | - | Disables torch.compile and CUDA graphs |
+| `--enable-expert-parallel` | flag | - | Enables EP for MoE models |
+| `--context-parallel-size` | 1,2,4,8 | 1 | DCP: splits context across GPU groups |
+| `--max-model-len` | int | model default | Maximum sequence length |
+| `--kv-cache-dtype` | fp8,auto | auto | KV cache quantization |
+| `--enable-prefix-caching` | flag | - | Cache common prompt prefixes |
+| `--enable-chunked-prefill` | flag | - | Process prompts in chunks |
+
+### Speculative Decoding
+| Parameter | Options | Default | Description |
+|-----------|---------|---------|-------------|
+| `--speculative-model` | model,[ngram] | - | Draft model for speculation |
+| `--num-speculative-tokens` | 1-8 | - | Number of tokens to speculate |
+
+### Memory Management
+| Parameter | Options | Default | Description |
+|-----------|---------|---------|-------------|
+| `--gpu-memory-utilization` | 0.0-1.0 | 0.9 | Fraction of GPU memory to use |
+| `--swap-space` | int (GB) | 4 | CPU swap space for KV cache |
+
+## Notes
+
+### max_num_seqs Auto-Calculation
+The experiments do NOT set `--max-num-seqs` explicitly. vLLM will automatically calculate the optimal value based on:
+- Available GPU memory after model loading
+- max_model_len setting
+- KV cache dtype (fp8 uses 50% less memory than bf16)
+
+This ensures each configuration maximizes KV cache utilization.
+
+### Distributed Context Parallel (DCP)
+DCP splits long sequences across GPU groups for parallel processing:
+- context-parallel-size=2: Sequence split across 2 GPU groups (4 GPUs each)
+- context-parallel-size=4: Sequence split across 4 GPU groups (2 GPUs each)
+- Best for very long sequences (64k+) where memory is the bottleneck
+- May increase inter-GPU communication overhead
+
+### MTP Speculative Decoding
+GLM-4.6 may support Multi-Token Prediction heads for self-speculative decoding:
+- Uses ngram-based speculation as a baseline
+- num-speculative-tokens controls speculation depth
+- Higher values = more aggressive speculation but higher rejection risk

@@ -4,23 +4,53 @@
 #PBS -e /dev/null
 #PBS -q AISG_large
 #PBS -l select=1:mem=1000gb:ngpus=8:ncpus=100
-#PBS -l walltime=4:00:00
+#PBS -l walltime=8:00:00
 
-# Experiment configuration - override with qsub -v
-# EXP_NAME: Experiment name (e.g., "1B_no_enforce_eager")
-# ENFORCE_EAGER: "yes" or "no"
-# ENABLE_EP: "yes" or "no" (Expert Parallelism)
-# MAX_MODEL_LEN: 8192, 32768, or 65536
-# EXTRA_ARGS: Additional vLLM arguments
+# ============================================================================
+# GLM-4.6 Experiment Runner
+# ============================================================================
+# Configuration variables - override with qsub -v
+#
+# Basic config:
+#   EXP_NAME: Experiment name (required)
+#   ENFORCE_EAGER: "yes" or "no" (default: yes)
+#   ENABLE_EP: "yes" or "no" - Expert Parallelism (default: yes)
+#   MAX_MODEL_LEN: 8192, 16384, 32768, 65536, 131072 (default: 32768)
+#
+# Advanced config:
+#   KV_CACHE_DTYPE: "fp8" or "auto" (default: fp8)
+#   ENABLE_PREFIX_CACHING: "yes" or "no" (default: yes)
+#   ENABLE_CHUNKED_PREFILL: "yes" or "no" (default: yes)
+#   ENABLE_MTP: "yes" or "no" - Multi-Token Prediction speculative decoding (default: no)
+#   MTP_NUM_TOKENS: Number of tokens for MTP (default: 2)
+#   CONTEXT_PARALLEL_SIZE: For DCP - Distributed Context Parallel (default: 1)
+#
+# Benchmark config:
+#   NUM_SAMPLES: Number of samples to benchmark (default: 100)
+#   DATASET_TYPE: "8k" or "64k" (default: 8k)
+#
+# Note: max_num_seqs is NOT set - vLLM will auto-calculate optimal value
+#       based on available KV cache memory after model loading
+# ============================================================================
 
 set -e
 
+# Parse configuration with defaults
 EXP_NAME="${EXP_NAME:-default}"
 ENFORCE_EAGER="${ENFORCE_EAGER:-yes}"
 ENABLE_EP="${ENABLE_EP:-yes}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-yes}"
+ENABLE_CHUNKED_PREFILL="${ENABLE_CHUNKED_PREFILL:-yes}"
+ENABLE_MTP="${ENABLE_MTP:-no}"
+MTP_NUM_TOKENS="${MTP_NUM_TOKENS:-2}"
+CONTEXT_PARALLEL_SIZE="${CONTEXT_PARALLEL_SIZE:-1}"
+NUM_SAMPLES="${NUM_SAMPLES:-100}"
+DATASET_TYPE="${DATASET_TYPE:-8k}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
+# Environment setup
 export SHARED_FS="/scratch/Projects/SPEC-SF-AISG"
 export CONTAINER_NAME="yuli_vllm_exp_${EXP_NAME}"
 export SQSH_DIR="${SHARED_FS}/sqsh"
@@ -46,26 +76,44 @@ echo "========================================"
 echo "Experiment: ${EXP_NAME}"
 echo "PBS Job ID: ${PBS_JOBID}"
 echo "Host: $(hostname)"
-echo "ENFORCE_EAGER: ${ENFORCE_EAGER}"
-echo "ENABLE_EP: ${ENABLE_EP}"
-echo "MAX_MODEL_LEN: ${MAX_MODEL_LEN}"
-echo "EXTRA_ARGS: ${EXTRA_ARGS}"
+echo "========================================"
+echo "Basic Configuration:"
+echo "  ENFORCE_EAGER: ${ENFORCE_EAGER}"
+echo "  ENABLE_EP: ${ENABLE_EP}"
+echo "  MAX_MODEL_LEN: ${MAX_MODEL_LEN}"
+echo "========================================"
+echo "Advanced Configuration:"
+echo "  KV_CACHE_DTYPE: ${KV_CACHE_DTYPE}"
+echo "  ENABLE_PREFIX_CACHING: ${ENABLE_PREFIX_CACHING}"
+echo "  ENABLE_CHUNKED_PREFILL: ${ENABLE_CHUNKED_PREFILL}"
+echo "  ENABLE_MTP: ${ENABLE_MTP}"
+echo "  MTP_NUM_TOKENS: ${MTP_NUM_TOKENS}"
+echo "  CONTEXT_PARALLEL_SIZE: ${CONTEXT_PARALLEL_SIZE} (DCP)"
+echo "========================================"
+echo "Benchmark Configuration:"
+echo "  NUM_SAMPLES: ${NUM_SAMPLES}"
+echo "  DATASET_TYPE: ${DATASET_TYPE}"
+echo "  EXTRA_ARGS: ${EXTRA_ARGS}"
 echo "========================================"
 
 export ENROOT_DATA_PATH="${SHARED_FS}/.enroot/data"
 mkdir -p "${ENROOT_DATA_PATH}"
 
+# Create container if it doesn't exist
 if ! enroot list | grep -q "${CONTAINER_NAME}"; then
     enroot create -n "${CONTAINER_NAME}" "${SQSH_FILE}"
 fi
 
+# Setup cache directories
 mkdir -p "${HF_HOME}" "${VLLM_CACHE_ROOT}" "${TORCH_HOME}/kernels" "${TRITON_CACHE_DIR}" "${XDG_CACHE_HOME}" "${CUDA_CACHE_PATH}"
 
+# Set CUDA_VISIBLE_DEVICES
 if command -v nvidia-smi &> /dev/null && nvidia-smi &> /dev/null; then
     num_gpus=$(nvidia-smi -L | wc -l)
     export CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((num_gpus - 1)))
 fi
 
+# Build environment arguments for enroot
 env_args=""
 prefixes=("NCCL" "CUDA" "SHARED" "HF" "WANDB" "XDG" "LOG" "CACHE" "TORCH" "TRITON" "VLLM")
 for prefix in "${prefixes[@]}"; do
@@ -76,39 +124,75 @@ for prefix in "${prefixes[@]}"; do
     done < <(env | grep "^${prefix}_" | cut -d'=' -f1)
 done
 
+# Model configuration
 MODEL_NAME="zai-org/GLM-4.6"
 SERVED_MODEL_NAME="glm-4.6-exp"
 PORT=8003
 
+# ============================================================================
 # Build vLLM command arguments
+# ============================================================================
 VLLM_ARGS="--model ${MODEL_NAME}"
 VLLM_ARGS="${VLLM_ARGS} --served-model-name ${SERVED_MODEL_NAME}"
 VLLM_ARGS="${VLLM_ARGS} --tensor-parallel-size 8"
 VLLM_ARGS="${VLLM_ARGS} --dtype bfloat16"
-VLLM_ARGS="${VLLM_ARGS} --kv-cache-dtype fp8"
 VLLM_ARGS="${VLLM_ARGS} --gpu-memory-utilization 0.95"
 VLLM_ARGS="${VLLM_ARGS} --port ${PORT}"
 VLLM_ARGS="${VLLM_ARGS} --max-model-len ${MAX_MODEL_LEN}"
-VLLM_ARGS="${VLLM_ARGS} --max-num-seqs 8"
-VLLM_ARGS="${VLLM_ARGS} --max-num-batched-tokens ${MAX_MODEL_LEN}"
-VLLM_ARGS="${VLLM_ARGS} --enable-chunked-prefill"
-VLLM_ARGS="${VLLM_ARGS} --enable-prefix-caching"
 VLLM_ARGS="${VLLM_ARGS} --swap-space 32"
 VLLM_ARGS="${VLLM_ARGS} --trust-remote-code"
 
+# KV Cache dtype
+VLLM_ARGS="${VLLM_ARGS} --kv-cache-dtype ${KV_CACHE_DTYPE}"
+
+# Note: max_num_seqs and max_num_batched_tokens are NOT set
+# vLLM will auto-calculate optimal values based on available memory
+
+# Eager mode (disables torch.compile and CUDA graphs)
 if [ "${ENFORCE_EAGER}" = "yes" ]; then
     VLLM_ARGS="${VLLM_ARGS} --enforce-eager"
 fi
 
+# Expert Parallelism for MoE
 if [ "${ENABLE_EP}" = "yes" ]; then
     VLLM_ARGS="${VLLM_ARGS} --enable-expert-parallel"
 fi
 
+# Prefix caching
+if [ "${ENABLE_PREFIX_CACHING}" = "yes" ]; then
+    VLLM_ARGS="${VLLM_ARGS} --enable-prefix-caching"
+fi
+
+# Chunked prefill
+if [ "${ENABLE_CHUNKED_PREFILL}" = "yes" ]; then
+    VLLM_ARGS="${VLLM_ARGS} --enable-chunked-prefill"
+fi
+
+# Distributed Context Parallel (DCP)
+if [ "${CONTEXT_PARALLEL_SIZE}" -gt 1 ]; then
+    VLLM_ARGS="${VLLM_ARGS} --context-parallel-size ${CONTEXT_PARALLEL_SIZE}"
+fi
+
+# Multi-Token Prediction (MTP) Speculative Decoding
+# Note: This uses the model's own MTP heads for self-speculative decoding
+if [ "${ENABLE_MTP}" = "yes" ]; then
+    VLLM_ARGS="${VLLM_ARGS} --num-speculative-tokens ${MTP_NUM_TOKENS}"
+    VLLM_ARGS="${VLLM_ARGS} --speculative-model [ngram]"
+    # Alternative: use MTP heads if model supports it
+    # VLLM_ARGS="${VLLM_ARGS} --speculative-model-quantization None"
+fi
+
+# Additional arguments
 VLLM_ARGS="${VLLM_ARGS} ${EXTRA_ARGS}"
 
-echo "Starting vLLM with arguments: ${VLLM_ARGS}"
+echo ""
+echo "Starting vLLM with arguments:"
+echo "${VLLM_ARGS}" | tr ' ' '\n' | grep -v '^$' | sed 's/^/  /'
+echo ""
 
-# Start server in background
+# ============================================================================
+# Start server
+# ============================================================================
 enroot start --root --rw \
     --mount="${HOME}:${HOME}" \
     --mount="${SHARED_FS}:${SHARED_FS}" \
@@ -118,50 +202,102 @@ enroot start --root --rw \
 
 SERVER_PID=$!
 
-# Wait for server to be ready (max 10 minutes)
-echo "Waiting for server to start..."
-for i in {1..60}; do
+# Wait for server to be ready (max 30 minutes for compilation)
+echo "Waiting for server to start (max 30 minutes)..."
+MAX_WAIT=1800
+WAIT_INTERVAL=30
+ELAPSED=0
+
+while [ $ELAPSED -lt $MAX_WAIT ]; do
     if curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
-        echo "Server is ready after $((i * 10)) seconds"
+        echo "Server is ready after $ELAPSED seconds"
         break
     fi
-    sleep 10
+    
+    # Check if server process died
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "ERROR: Server process died unexpectedly"
+        exit 1
+    fi
+    
+    sleep $WAIT_INTERVAL
+    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+    echo "  Still waiting... ($ELAPSED seconds elapsed)"
 done
 
 if ! curl -s "http://$(hostname):${PORT}/health" > /dev/null 2>&1; then
-    echo "ERROR: Server failed to start"
+    echo "ERROR: Server failed to start after $MAX_WAIT seconds"
     kill $SERVER_PID 2>/dev/null || true
     exit 1
 fi
 
+# Get server info
+echo ""
 echo "Server running on $(hostname):${PORT}"
-echo "Experiment: ${EXP_NAME}"
+curl -s "http://$(hostname):${PORT}/v1/models" | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if data.get('data'):
+    m = data['data'][0]
+    print(f\"  Model: {m.get('id')}\")
+    print(f\"  Max model len: {m.get('max_model_len')}\")
+" 2>/dev/null || echo "  (Could not retrieve model info)"
+echo ""
 
+# ============================================================================
 # Run benchmark
+# ============================================================================
 BENCHMARK_DIR="${SHARED_FS}/source_files/Mech/mech-util/local_model_server"
 DATASET_DIR="${SHARED_FS}/source_files/Mech/storage/samples/glm46_benchmark"
+
+# Select dataset
+if [ "${DATASET_TYPE}" = "64k" ]; then
+    DATASET_FILE="${DATASET_DIR}/dataset_64k.json"
+else
+    DATASET_FILE="${DATASET_DIR}/dataset_8k.json"
+fi
+
+echo "Running benchmark with ${NUM_SAMPLES} samples from ${DATASET_TYPE} dataset..."
 
 python3 ${BENCHMARK_DIR}/benchmark_runner.py \
     --base-url "http://$(hostname):${PORT}" \
     --model "${SERVED_MODEL_NAME}" \
-    --dataset "${DATASET_DIR}/dataset_8k.json" \
-    --samples 3 \
+    --dataset "${DATASET_FILE}" \
+    --samples ${NUM_SAMPLES} \
     --config-name "${EXP_NAME}" \
-    --output "${LOG_DIR}/results_8k.json"
+    --output "${LOG_DIR}/results_${DATASET_TYPE}.json"
 
-# For long context experiments, also test with 64k dataset
-if [ "${MAX_MODEL_LEN}" -ge 65536 ]; then
+# If max_model_len is large enough, also test with 64k dataset
+if [ "${DATASET_TYPE}" = "8k" ] && [ "${MAX_MODEL_LEN}" -ge 131072 ]; then
+    echo ""
+    echo "Also running benchmark with 64k dataset..."
     python3 ${BENCHMARK_DIR}/benchmark_runner.py \
         --base-url "http://$(hostname):${PORT}" \
         --model "${SERVED_MODEL_NAME}" \
         --dataset "${DATASET_DIR}/dataset_64k.json" \
-        --samples 2 \
+        --samples $((NUM_SAMPLES / 2)) \
         --config-name "${EXP_NAME}_64k" \
         --output "${LOG_DIR}/results_64k.json"
 fi
 
-echo "Benchmark complete. Results in ${LOG_DIR}"
+echo ""
+echo "========================================"
+echo "Benchmark complete!"
+echo "Results saved to: ${LOG_DIR}"
+echo "========================================"
 
-# Keep server running for manual inspection (optional)
-# Comment out the following if you want the job to end after benchmarks
-# wait $SERVER_PID
+# Collect final server stats
+echo ""
+echo "Final server metrics:"
+curl -s "http://$(hostname):${PORT}/metrics" 2>/dev/null | grep -E "(vllm_|gpu_)" | head -20 || echo "  (Metrics not available)"
+
+# Keep server running for additional testing if needed
+# Uncomment the following line to end job after benchmark
+# kill $SERVER_PID 2>/dev/null || true; exit 0
+
+echo ""
+echo "Server still running for manual testing. Job will end when walltime expires."
+echo "Connect to: http://$(hostname):${PORT}"
+
+# Wait for server
+wait $SERVER_PID
