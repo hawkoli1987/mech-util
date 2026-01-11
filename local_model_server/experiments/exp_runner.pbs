@@ -183,9 +183,10 @@ fi
 
 # Speculative Decoding (ngram-based)
 # vLLM 0.11 uses --speculative-config with JSON format
-# Note: Use single quotes around the JSON to prevent shell escaping issues
+# Use compact JSON (no spaces) to avoid word splitting issues
 if [ "${ENABLE_MTP}" = "yes" ]; then
-    VLLM_ARGS="${VLLM_ARGS} --speculative-config '{\"method\": \"ngram\", \"num_speculative_tokens\": ${MTP_NUM_TOKENS}, \"prompt_lookup_max\": ${MTP_NUM_TOKENS}}'"
+    SPEC_CONFIG="{\"method\":\"ngram\",\"num_speculative_tokens\":${MTP_NUM_TOKENS},\"prompt_lookup_max\":${MTP_NUM_TOKENS}}"
+    VLLM_ARGS="${VLLM_ARGS} --speculative-config ${SPEC_CONFIG}"
 fi
 
 # Additional arguments
