@@ -135,13 +135,30 @@ echo "Container type: ${MECH_CONTAINER_TYPE}"
 echo "Installing mech packages in editable mode..."
 echo "=================================================="
 
-pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util
+# Check if mech-util is already installed in editable mode
+# Editable installs reflect source changes immediately - only need to install once per container session
+if ! pip show mech-util >/dev/null 2>&1; then
+    echo "Installing mech-util..."
+    pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util
+else
+    echo "mech-util already installed (editable mode reflects changes immediately)"
+fi
 
 # Install container-specific packages
 if [ "${MECH_CONTAINER_TYPE}" = "calculix" ]; then
-    pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/simulation-agent-calculix[test]
+    if ! pip show simulation-agent-calculix >/dev/null 2>&1; then
+        echo "Installing simulation-agent-calculix..."
+        pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/simulation-agent-calculix[test]
+    else
+        echo "simulation-agent-calculix already installed (editable mode reflects changes immediately)"
+    fi
 elif [ "${MECH_CONTAINER_TYPE}" = "freecad" ]; then
-    pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/component-agent-cadquery[test]
+    if ! pip show component-agent-cadquery >/dev/null 2>&1; then
+        echo "Installing component-agent-cadquery..."
+        pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/component-agent-cadquery[test]
+    else
+        echo "component-agent-cadquery already installed (editable mode reflects changes immediately)"
+    fi
 fi
 
 echo "=================================================="
