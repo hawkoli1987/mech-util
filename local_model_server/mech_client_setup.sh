@@ -131,26 +131,61 @@ STARTUP_SCRIPT="${HOME}/.container_startup_$$.sh"
 cat > "${STARTUP_SCRIPT}" << 'STARTUPEOF'
 #!/bin/bash
 echo "=================================================="
+echo "Container type: ${MECH_CONTAINER_TYPE}"
 echo "Installing mech packages in editable mode..."
 echo "=================================================="
 
 pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/mech-util
 
-# If simulation container, also install simulation-agent-calculix
+# Install container-specific packages
 if [ "${MECH_CONTAINER_TYPE}" = "calculix" ]; then
     pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/simulation-agent-calculix[test]
+elif [ "${MECH_CONTAINER_TYPE}" = "freecad" ]; then
+    pip install -e /scratch/Projects/SPEC-SF-AISG/source_files/Mech/component-agent-cadquery[test]
 fi
 
 echo "=================================================="
-echo "Checking tools..."
+echo "Checking tools for ${MECH_CONTAINER_TYPE} container..."
 echo "=================================================="
 
-# Check if CalculiX is available (for simulation container)
-if command -v ccx &> /dev/null; then
-    echo "✓ CalculiX (ccx) found: $(which ccx)"
-fi
-if command -v gmsh &> /dev/null; then
-    echo "✓ Gmsh found: $(which gmsh)"
+# Check container-specific tools
+if [ "${MECH_CONTAINER_TYPE}" = "calculix" ]; then
+    # Simulation container: check for CalculiX, Gmsh, CGX
+    if command -v ccx &> /dev/null; then
+        echo "✓ CalculiX (ccx) found: $(which ccx)"
+    else
+        echo "✗ CalculiX (ccx) not found"
+    fi
+    if command -v gmsh &> /dev/null; then
+        echo "✓ Gmsh found: $(which gmsh)"
+    else
+        echo "✗ Gmsh not found"
+    fi
+    if command -v cgx &> /dev/null; then
+        echo "✓ CGX found: $(which cgx)"
+    else
+        echo "✗ CGX not found"
+    fi
+elif [ "${MECH_CONTAINER_TYPE}" = "freecad" ]; then
+    # Component/Assembly container: check for FreeCAD, CadQuery
+    if python3 -c "import FreeCAD" 2>/dev/null; then
+        echo "✓ FreeCAD Python module available"
+    else
+        echo "✗ FreeCAD Python module not available"
+    fi
+    if python3 -c "import cadquery" 2>/dev/null; then
+        echo "✓ CadQuery available"
+    else
+        echo "✗ CadQuery not available"
+    fi
+    if command -v gmsh &> /dev/null; then
+        echo "✓ Gmsh found: $(which gmsh)"
+    else
+        echo "✗ Gmsh not found (optional for meshing)"
+    fi
+else
+    # vLLM container: minimal checks
+    echo "vLLM container - no specific tools required"
 fi
 
 echo "=================================================="
