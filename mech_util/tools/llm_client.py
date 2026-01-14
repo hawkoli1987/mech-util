@@ -7,11 +7,11 @@ Used by both tests and production code.
 Following rules from .cursor/rules/03_prompts_and_provenance.md:
 - No hardcoded model names (query server)
 - Explicit error messages for misconfigurations
-- Environment variable configuration
+- No hidden fallbacks for endpoints; api_base is required.
 """
 
-import os
 from typing import Optional
+
 import requests
 from langchain_openai import ChatOpenAI
 
@@ -24,7 +24,7 @@ def get_available_model(api_base: str) -> str:
     rather than hardcoding model names.
     
     Args:
-        api_base: Base URL of the vLLM server (e.g., "http://hopper-34:8001")
+        api_base: Base URL of the vLLM server (e.g., "http://localhost:8001")
     
     Returns:
         Model name string (e.g., "Qwen/Qwen3-8B")
@@ -73,7 +73,7 @@ def get_available_model(api_base: str) -> str:
 
 
 def create_llm_client(
-    api_base: Optional[str] = None,
+    api_base: str,
     model_name: Optional[str] = None,
     temperature: float = 0.7,
     timeout: int = 300,
@@ -84,13 +84,11 @@ def create_llm_client(
     Create LangChain ChatOpenAI client connected to vLLM server.
     
     This function handles:
-    - Environment variable configuration
     - Automatic model discovery from server
     - OpenAI-compatible API setup for vLLM
     
     Args:
-        api_base: Base URL of vLLM server. If None, reads OPENAI_API_BASE env var.
-                  Default: "http://hopper-34:8001"
+        api_base: Base URL of vLLM server (required).
         model_name: Model name to use. If None, queries server to detect.
         temperature: Sampling temperature (0.0-1.0)
         timeout: Request timeout in seconds
@@ -103,16 +101,7 @@ def create_llm_client(
     Raises:
         RuntimeError: If server is unreachable or misconfigured
     
-    Environment Variables:
-        OPENAI_API_BASE: vLLM server URL (e.g., "http://hopper-34:8001")
-        LLM_MODEL_NAME: Optional override for model name
-    
     Example:
-        >>> # Automatic discovery
-        >>> llm = create_llm_client()
-        >>> response = llm.invoke([HumanMessage(content="Hello")])
-        
-        >>> # Explicit configuration
         >>> llm = create_llm_client(
         ...     api_base="http://localhost:8001",
         ...     model_name="Qwen/Qwen3-8B",
@@ -120,16 +109,9 @@ def create_llm_client(
         ...     max_tokens=2048
         ... )
     """
-    # Get API base URL
-    if api_base is None:
-        api_base = os.environ.get("OPENAI_API_BASE", "http://hopper-34:8001")
-    
     # Get model name (query server if not provided)
     if model_name is None:
-        model_name = os.environ.get("LLM_MODEL_NAME")
-        if model_name is None:
-            # Auto-discover from server
-            model_name = get_available_model(api_base)
+        model_name = get_available_model(api_base)
     
     print(f"  → Creating LLM client: {api_base} (model: {model_name})")
     
@@ -157,7 +139,7 @@ def create_llm_client(
 
 
 def create_vlm_client(
-    api_base: Optional[str] = None,
+    api_base: str,
     model_name: Optional[str] = None,
     temperature: float = 0.7,
     timeout: int = 300,
@@ -167,11 +149,10 @@ def create_vlm_client(
     """
     Create LangChain ChatOpenAI client connected to VLM server.
     
-    Same as create_llm_client but defaults to OPENAI_API_BASE2 for vision models.
+    Same as create_llm_client but for VLM servers.
     
     Args:
-        api_base: Base URL of VLM server. If None, reads OPENAI_API_BASE2 env var.
-                  Default: "http://hopper-34:8002"
+        api_base: Base URL of VLM server (required).
         model_name: Model name to use. If None, queries server to detect.
         temperature: Sampling temperature (0.0-1.0)
         timeout: Request timeout in seconds
@@ -181,17 +162,11 @@ def create_vlm_client(
     Returns:
         Configured ChatOpenAI client for vision tasks
     
-    Environment Variables:
-        OPENAI_API_BASE2: VLM server URL (e.g., "http://hopper-34:8002")
-    
     Example:
         >>> from tools import create_vlm_client
-        >>> vlm = create_vlm_client()
+        >>> vlm = create_vlm_client(api_base="http://localhost:8002")
         >>> # Use for vision tasks
     """
-    if api_base is None:
-        api_base = os.environ.get("OPENAI_API_BASE2", "http://hopper-34:8002")
-    
     return create_llm_client(
         api_base=api_base,
         model_name=model_name,
@@ -202,16 +177,17 @@ def create_vlm_client(
     )
 
 
-def get_llm_for_tests(temperature: float = 0.7) -> ChatOpenAI:
+def get_llm_for_tests(api_base: str, temperature: float = 0.7) -> ChatOpenAI:
     """
     Convenience function for creating LLM client in tests.
     
     This is a simplified wrapper around create_llm_client() that:
-    - Uses default server (OPENAI_API_BASE or hopper-34:8001)
+    - Uses the provided server api_base
     - Auto-discovers model name
     - Sets reasonable test defaults
     
     Args:
+        api_base: Base URL of vLLM server (required).
         temperature: Sampling temperature for tests (default: 0.7)
     
     Returns:
@@ -223,12 +199,12 @@ def get_llm_for_tests(temperature: float = 0.7) -> ChatOpenAI:
     Example:
         >>> @pytest.fixture
         ... def real_llm():
-        ...     return get_llm_for_tests()
+        ...     return get_llm_for_tests(api_base="http://localhost:8001")
     """
-    return create_llm_client(temperature=temperature)
+    return create_llm_client(api_base=api_base, temperature=temperature)
 
 
-def check_llm_availability(api_base: Optional[str] = None, verbose: bool = True) -> bool:
+def check_llm_availability(api_base: str, verbose: bool = True) -> bool:
     """
     Check if vLLM server is available and responding.
     
@@ -238,7 +214,7 @@ def check_llm_availability(api_base: Optional[str] = None, verbose: bool = True)
     - Debugging connection issues
     
     Args:
-        api_base: Base URL of vLLM server. If None, uses OPENAI_API_BASE env var.
+        api_base: Base URL of vLLM server (required).
         verbose: If True, print status messages
     
     Returns:
@@ -256,9 +232,6 @@ def check_llm_availability(api_base: Optional[str] = None, verbose: bool = True)
         ...         pytest.skip("vLLM server not available")
         ...     return get_llm_for_tests()
     """
-    if api_base is None:
-        api_base = os.environ.get("OPENAI_API_BASE", "http://hopper-34:8001")
-    
     try:
         model_name = get_available_model(api_base)
         if verbose:
