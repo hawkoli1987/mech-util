@@ -51,12 +51,13 @@ memory profiling, without manual calculation.
 | Max Model Len | `--max-model-len N` | model default | Context window size |
 | **DCP** | `--decode-context-parallel-size N` | 1 | Shards KV cache across GPUs |
 
-### ✅ DCP (Decoder Context Parallelism) - NEW in vLLM 0.12
-DCP shards the KV cache across multiple GPUs during the decoding phase:
-- Increases total KV cache capacity
-- Improves memory efficiency for long contexts
-- Valid values: 1, 2, 4, 8 (must divide `tensor_parallel_size=8`)
-- Best for 64k+ context workloads
+### ❌ DCP (Decoder Context Parallelism) - NOT Compatible with GLM-4.6
+DCP shards the KV cache across multiple GPUs during the decoding phase.
+**However, GLM-4.6 is incompatible**:
+- GLM-4.6 has `num_kv_heads=8` 
+- DCP requires `tensor_parallel_size > num_kv_heads`
+- With TP=8, DCP > 1 fails with: `tensor parallel size 8 must be greater than total num kv heads 8`
+- **Only DCP=1 (disabled) works**
 
 ### ❌ NOT Supported in vLLM 0.12
 | Feature | Status | Notes |
@@ -87,36 +88,38 @@ However, vLLM 0.12 does NOT support GLM-specific MTP:
 | 2B | no | 8k | ❌ Timeout | 2x slower load, likely OOM |
 
 ### Group 3: Max Model Length
-| Exp | max-model-len | Dataset | Status | Notes |
-|-----|---------------|---------|--------|-------|
-| 3A | 16384 | 8k | ⏳ Pending | Lower memory, higher max_num_seqs |
-| 3B | 32768 (baseline) | 8k | ✅ Baseline | - |
-| 3C | 65536 | 8k | ⏳ Pending | Higher memory, lower max_num_seqs |
+| Exp | max-model-len | Dataset | max_num_seqs | TPS | Status | Notes |
+|-----|---------------|---------|--------------|-----|--------|-------|
+| 3A | 16384 | 8k | **133** | **9.06** | ✅ Done | 2.2x concurrency! |
+| 3B | 32768 (baseline) | 8k | 61 | 8.69 | ✅ Baseline | - |
+| 3C | 65536 | 8k | **33** | **9.07** | ✅ Done | 0.5x concurrency |
 
 ### Group 4: KV Cache Dtype
-| Exp | kv-cache-dtype | Dataset | Status | Notes |
-|-----|----------------|---------|--------|-------|
-| 4A | fp8 (baseline) | 8k | ✅ Baseline | 50% KV memory savings |
-| 4B | auto (bf16) | 8k | ⏳ Pending | 2x KV memory, lower max_num_seqs |
+| Exp | kv-cache-dtype | Dataset | max_num_seqs | TPS | Status | Notes |
+|-----|----------------|---------|--------------|-----|--------|-------|
+| 4A | fp8 (baseline) | 8k | 61 | 8.69 | ✅ Baseline | 50% KV memory |
+| 4B | auto (bf16) | 8k | **33** | **8.97** | ✅ Done | 2x KV memory, 0.5x concurrency |
 
 ### Group 5: Prefix Caching
-| Exp | enable-prefix-caching | Dataset | Status | Notes |
-|-----|----------------------|---------|--------|-------|
-| 5A | yes (baseline) | 8k | ✅ Baseline | Good for repeated prompts |
-| 5B | no | 8k | ⏳ Pending | - |
+| Exp | enable-prefix-caching | Dataset | max_num_seqs | TPS | Status | Notes |
+|-----|----------------------|---------|--------------|-----|--------|-------|
+| 5A | yes (baseline) | 8k | 61 | 8.69 | ✅ Baseline | Good for repeated prompts |
+| 5B | no | 8k | **66** | **9.12** | ✅ Done | Slightly higher TPS |
 
 ### Group 6: Chunked Prefill
-| Exp | chunked-prefill | Dataset | Status | Notes |
-|-----|-----------------|---------|--------|-------|
-| 6A | yes (baseline) | 8k | ✅ Baseline | V1 default |
-| 6B | no | 8k | ⏳ Pending | Uses `--no-enable-chunked-prefill` |
+| Exp | chunked-prefill | Dataset | max_num_seqs | TPS | Status | Notes |
+|-----|-----------------|---------|--------------|-----|--------|-------|
+| 6A | yes (baseline) | 8k | 61 | 8.69 | ✅ Baseline | V1 default |
+| 6B | no | 8k | **64** | **9.19** | ✅ Done | Slightly higher TPS |
 
 ### Group 7: Decoder Context Parallelism (DCP)
 | Exp | decode-context-parallel-size | max-model-len | Dataset | Status | Notes |
 |-----|------------------------------|---------------|---------|--------|-------|
-| 7A | 1 (baseline) | 65536 | 64k | ⏳ Pending | No DCP, long context |
-| 7B | 2 | 65536 | 64k | ⏳ Pending | DCP=2, KV sharded across 2 GPUs |
-| 7C | 4 | 65536 | 64k | ⏳ Pending | DCP=4, KV sharded across 4 GPUs |
+| 7A | 1 (baseline) | 65536 | 64k | ⏸️ Timeout | Job hit walltime |
+| 7B | 2 | 65536 | 64k | ❌ Failed | **Incompatible with GLM-4.6** |
+| 7C | 4 | 65536 | 64k | ❌ Failed | **Incompatible with GLM-4.6** |
+
+**DCP Failure Reason**: GLM-4.6 has `num_kv_heads=8`. DCP requires `tensor_parallel_size > num_kv_heads`.
 
 ## PBS Submission Commands
 
@@ -161,19 +164,21 @@ vllm serve zai-org/GLM-4.6 \
 
 ## Results Summary
 
-| Exp | Config | max_num_seqs | TPS | Status | Notes |
-|-----|--------|--------------|-----|--------|-------|
-| 1A | baseline | 61 | 8.69 | ✅ | vLLM reported 61.44x concurrency |
-| 1B | compiled | - | - | ❌ | torch.compile timeout |
-| 2B | no EP | - | - | ❌ | Load timeout (2x slower) |
-| 3A | len=16k | TBD | - | ⏳ | Higher concurrency expected |
-| 3C | len=65k | TBD | - | ⏳ | Lower concurrency expected |
-| 4B | kv=bf16 | TBD | - | ⏳ | 2x KV memory |
-| 5B | no prefix | TBD | - | ⏳ | - |
-| 6B | no chunk | TBD | - | ⏳ | - |
-| 7A | dcp1,len=65k | TBD | - | ⏳ | Baseline for DCP comparison |
-| 7B | dcp2,len=65k | TBD | - | ⏳ | KV sharded across 2 GPUs |
-| 7C | dcp4,len=65k | TBD | - | ⏳ | KV sharded across 4 GPUs |
+| Exp | Config | max_num_seqs | Avg TPS | Samples | Status | Notes |
+|-----|--------|--------------|---------|---------|--------|-------|
+| 1A | baseline (32k) | 61 | 8.69 | 10 | ✅ | vLLM reported 61.44x concurrency |
+| 1B | compiled | - | - | 0 | ❌ | torch.compile timeout (20+ min) |
+| 2B | no EP | - | - | 0 | ❌ | Load timeout (2x slower) |
+| **3A** | **len=16k** | **133** | **9.06** | 27 | ✅ | 2x concurrency vs baseline |
+| **3C** | **len=65k** | **33** | **9.07** | 27 | ✅ | 0.5x concurrency vs baseline |
+| **4B** | **kv=bf16** | **33** | **8.97** | 27 | ✅ | 2x KV memory, 0.5x concurrency |
+| **5B** | **no prefix** | **66** | **9.12** | 27 | ✅ | Similar to baseline |
+| **6B** | **no chunked** | **64** | **9.19** | 27 | ✅ | Slightly faster TPS |
+| 7A | dcp1,len=65k | 33 | - | 0 | ⏸️ Timeout | 64k dataset too slow |
+| 7B | dcp2,len=65k | - | - | 0 | ❌ | DCP incompatible with GLM-4.6 |
+| 7C | dcp4,len=65k | - | - | 0 | ❌ | DCP incompatible with GLM-4.6 |
+
+**Note**: Jobs hit 8-hour walltime with 27/100 samples. TPS stable at ~9 tokens/s across configs.
 
 ## Key Findings
 
@@ -194,7 +199,49 @@ vllm serve zai-org/GLM-4.6 \
 - Extract Y.YY, floor to integer for optimal `max_num_seqs`
 - Each configuration has different KV cache capacity → different optimal concurrency
 
-### 5. DCP for Long Contexts
-- DCP shards KV cache across GPUs, increasing total capacity
-- Best used with long contexts (64k+) where single-GPU KV cache is insufficient
-- Must divide tensor_parallel_size (8): valid values are 1, 2, 4, 8
+### 5. DCP NOT Compatible with GLM-4.6
+- **Error**: `tensor parallel size 8 must be greater than total num kv heads 8 when enable decode context parallel`
+- GLM-4.6 has `num_kv_heads=8`, and with `tensor_parallel_size=8`, DCP > 1 is impossible
+- DCP would require `tensor_parallel_size > num_kv_heads`
+
+### 6. max_model_len Affects Concurrency, Not TPS
+- `max_model_len=16k` → max_num_seqs=133 (2.2x more than 32k)
+- `max_model_len=65k` → max_num_seqs=33 (0.5x of 32k)
+- TPS remains stable at ~9 tokens/s regardless of context length
+- **Recommendation**: Use shorter context when workload allows for higher throughput
+
+### 7. KV Cache Dtype Impact
+- `kv-cache-dtype=fp8` → max_num_seqs=61 (baseline)
+- `kv-cache-dtype=auto` (bf16) → max_num_seqs=33 (0.5x concurrency)
+- TPS slightly lower (8.97 vs 9.06)
+- **Recommendation**: Keep fp8 for 2x concurrency with minimal quality loss
+
+### 8. Prefix Caching Minimal Impact
+- With prefix caching: max_num_seqs=61, TPS=8.69
+- Without prefix caching: max_num_seqs=66, TPS=9.12
+- Slightly higher TPS without, but loses cache benefits for repeated prompts
+- **Recommendation**: Enable for production with repeated system prompts
+
+### 9. Chunked Prefill Minimal Impact
+- With chunked prefill: max_num_seqs=61, TPS=8.69 (baseline)
+- Without chunked prefill: max_num_seqs=64, TPS=9.19
+- Slightly higher TPS without chunked prefill
+- **Recommendation**: Default (enabled) is fine for most workloads
+
+## Optimal Configuration for GLM-4.6 on 8x H200
+
+```bash
+vllm serve zai-org/GLM-4.6 \
+    --tensor-parallel-size 8 \
+    --enable-expert-parallel \      # Required for MoE
+    --enforce-eager \               # Required to avoid 20+ min cold start
+    --dtype bfloat16 \
+    --kv-cache-dtype fp8 \          # 2x concurrency vs bf16
+    --gpu-memory-utilization 0.95 \
+    --max-model-len 32768 \         # Adjust based on workload
+    --max-num-seqs 61 \             # From vLLM probe run
+    --enable-chunked-prefill \      # Default in V1
+    --enable-prefix-caching \       # Good for repeated prompts
+    --swap-space 32 \
+    --trust-remote-code
+```

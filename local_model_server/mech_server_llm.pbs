@@ -1,5 +1,5 @@
 #!/bin/bash
-#PBS -N llm_server_2
+#PBS -N llm_server
 #PBS -o /dev/null
 #PBS -e /dev/null
 #PBS -q AISG_large
