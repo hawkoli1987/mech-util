@@ -1,6 +1,6 @@
-#bin/bash
-# Usage: 
-# bash local_model_server/port_forward_from_local.sh
+#!/bin/bash
+# Usage:
+# bash mech-util/local_dev/connect_vllm_from_local.sh
 
 # check if the port is already in use (do it in both local and hopper login node)
 lsof -i :8001  # should be empty
