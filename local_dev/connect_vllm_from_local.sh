@@ -27,6 +27,17 @@ ssh hopper \
 # binds local PC port 8002 to hopper login node port 8002, doing it in background
 ssh -f -N -L 8002:localhost:8002 hopper
 
+
+############################################################
+# Embedding server
+############################################################
+# binds hopper login node port 8004 to compute node 34 port 8004, 
+ssh hopper \
+  'ssh -f -N -L 8004:localhost:8004 hopper-34'
+
+# binds local PC port 8004 to hopper login node port 8004, doing it in background
+ssh -f -N -L 8004:localhost:8004 hopper
+
 ############################################################
 # test the port forwarding via curl
 ############################################################
@@ -40,4 +51,10 @@ echo && echo "--- VLM ---" && \
 # curl -s http://localhost:8002/v1/models
 export OPENAI_API_BASE2="http://localhost:8002"
 curl -s ${OPENAI_API_BASE2}/v1/models | \
+python3 -c "import sys, json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))"
+
+echo && echo "--- Embedding ---" && \
+# curl -s http://localhost:8004/v1/models
+export OPENAI_API_BASE3="http://localhost:8004"
+curl -s ${OPENAI_API_BASE3}/v1/models | \
 python3 -c "import sys, json; print('\n'.join(m['id'] for m in json.load(sys.stdin)['data']))"
